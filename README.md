@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 200 tests, no install step
+make test      # 201 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -96,7 +96,16 @@ accounts come from Generator Mode, which appends: the new ones are saved alongsi
 with ids that continue, and the list grows by exactly the new accounts. `--bootstrap` never
 touches an existing database — it is a no-op once `var\test.db` exists.
 
-`build_exe.bat` is the optional next step: it runs PyInstaller and produces
+There is a third way to get the binary: the `windows-exe` workflow builds it on a GitHub
+Windows runner and uploads it as a run artifact (and attaches it to the release on a `v*` tag),
+because PyInstaller cannot cross-compile — the `.exe` has to be produced on Windows somewhere.
+The CI job does not stop at "it built": it launches `SignupFixtureLab.exe` from an unrelated
+working directory and requires `/api/state` to report the seeded accounts and
+`dist\var\accounts.txt` to exist beside it, which is the folder-anchoring rule above being
+checked on the only platform where it matters. Expect SmartScreen to warn ("Windows protected
+your PC" → More info → Run anyway): the binary is unsigned, and there is no installer.
+
+`build_exe.bat` is the local version of the same step: it runs PyInstaller and produces
 `dist\SignupFixtureLab.exe`, one file you can copy wherever you work. It has to be run on
 Windows — PyInstaller is not a cross-compiler, so a binary built on Linux or macOS will not
 execute here. The `.exe` sets the same defaults `run.bat` passes (it has no place to type
@@ -563,7 +572,7 @@ The suite behind all of this is `tests/test_console.py` (61 tests: the settings 
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in
-`tests/test_mockapi.py`, and the repo is at 200 under `make test`.
+`tests/test_mockapi.py`, and the repo is at 201 under `make test`.
 
 ## Limits, honestly
 

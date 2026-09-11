@@ -172,6 +172,34 @@ class ConsistencyTest(unittest.TestCase):
         server = (ROOT / "console" / "server.py").read_text()
         self.assertEqual(server.count("sys.executable"), 1, "only bundle_home() may name the interpreter path")
 
+    def test_the_ci_build_and_the_bat_agree_on_their_flags(self) -> None:
+        """`build_exe.bat` cannot run in CI (it ends in `pause`, which would hang the runner), so
+        `.github/workflows/windows-exe.yml` repeats the PyInstaller command. Two copies of a
+        build command is exactly where a bundle starts missing a data file and fails only on the
+        other machine, so the two are compared here."""
+        bat = (ROOT / "build_exe.bat").read_text(encoding="utf-8", errors="replace")
+        wf_path = ROOT / ".github" / "workflows" / "windows-exe.yml"
+        self.assertTrue(wf_path.is_file(), "the workflow that produces the .exe is gone")
+        wf = wf_path.read_text(encoding="utf-8", errors="replace")
+        block = wf[wf.index("Build SignupFixtureLab.exe"):]
+        block = block[: block.index("- name:")]
+
+        def flags(text: str) -> set[str]:
+            return set(re.findall(r"--(?:name|onefile|clean|console|windowed|noconsole|add-data"
+                                  r"|collect-submodules|hidden-import|paths)", text))
+
+        self.assertEqual(flags(block), flags(bat), "the CI build passes different flags than build_exe.bat")
+        self.assertEqual(set(re.findall(r"--collect-submodules\s+([a-z_]+)", block)),
+                         set(re.findall(r"--collect-submodules\s+([a-z_]+)", bat)),
+                         "a package collected in one and not the other is an ImportError on Windows")
+        self.assertEqual(re.findall(r'--add-data "([^"]+)"', block),
+                         re.findall(r'--add-data "([^"]+)"', bat), "the bundled data files must match")
+        self.assertIn("console\__main__.py", block)
+        # the smoke test has to look for the thing the product promises, not just for a port
+        smoke = wf[wf.index("Smoke test the bundle"):]
+        for probe in ("/api/state", r"dist\var\accounts.txt"):
+            self.assertIn(probe, smoke, f"the CI smoke test stopped checking {probe!r}")
+
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real
         option on one of the entry points in CLI_MODULES."""

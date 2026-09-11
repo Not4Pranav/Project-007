@@ -1,0 +1,111 @@
+# Builds the Windows executable the repo's own entry point describes.
+#
+# PyInstaller is not a cross-compiler, so the .exe has to be produced on Windows. This job runs
+# the same command as build_exe.bat — but not the .bat itself, which ends in `pause` and would
+# hang the runner — then starts the built binary and checks that the first-run experience is
+# actually there: a fixture with accounts, and an account list beside it. The artifact is what
+# you download; on a tag, the same file is published on the release.
+name: windows-exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+    paths:
+      - "console/**"
+      - "seeds/**"
+      - "load/**"
+      - "mockapi/**"
+      - "abuse/**"
+      - "build_exe.bat"
+      - ".github/workflows/windows-exe.yml"
+  pull_request:
+    paths:
+      - "console/**"
+      - "seeds/**"
+      - "load/**"
+      - "mockapi/**"
+      - "abuse/**"
+      - "build_exe.bat"
+      - ".github/workflows/windows-exe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      # Mirrors build_exe.bat. Keep the two in step: tests/test_lint.py checks the flags and
+      # the bundled data paths against the .bat, not against this file.
+      - name: Build SignupFixtureLab.exe
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --console `
+            --name SignupFixtureLab `
+            --add-data "seeds\schema.sql;seeds" `
+            --collect-submodules console --collect-submodules seeds `
+            --collect-submodules load --collect-submodules mockapi --collect-submodules abuse `
+            console\__main__.py
+
+      - name: Smoke test the bundle
+        run: |
+          $exe = "dist\SignupFixtureLab.exe"
+          if (-not (Test-Path $exe)) { throw "no $exe after the build" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "built $exe ($size MB)"
+          # A frozen build defaults --bootstrap and --open-browser on, and anchors its relative
+          # paths to its own folder, so var\ lands next to the .exe however this is launched.
+          $proc = Start-Process -FilePath $exe -WorkingDirectory (Get-Location) -PassThru `
+            -WindowStyle Hidden -RedirectStandardOutput smoke.log -RedirectStandardError smoke.err
+          try {
+            $state = $null
+            for ($i = 0; $i -lt 45; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                $state = Invoke-RestMethod "http://127.0.0.1:8010/api/state" -TimeoutSec 5
+                if ($state.fixture.tables.users -ge 1) { break }
+              } catch { }
+            }
+            if ($null -eq $state) { throw "the .exe never answered /api/state" }
+            if ($state.fixture.tables.users -lt 5) {
+              throw "first run seeded $($state.fixture.tables.users) accounts; expected bootstrap_accounts (5)"
+            }
+            $list = @(Get-Content "dist\var\accounts.txt" | Where-Object { $_ -and $_ -notmatch "^#" })
+            if ($list.Count -lt 5) {
+              throw "dist\var\accounts.txt has $($list.Count) accounts listed; expected 5 next to the .exe"
+            }
+            Write-Host "seeded $($state.fixture.tables.users) accounts, $($list.Count) listed at dist\var\accounts.txt"
+          } finally {
+            if ($null -ne $proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+            Get-Content smoke.log, smoke.err -ErrorAction SilentlyContinue | Select-Object -Last 40
+          }
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignupFixtureLab-windows
+          path: dist/SignupFixtureLab.exe
+          if-no-files-found: error
+
+      # Only on a tag: a release is the one place a downloaded .exe is worth attaching, and
+      # SmartScreen will warn about it regardless (it is unsigned), so the notes say why.
+      - name: Publish on the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/SignupFixtureLab.exe `
+            --title "Signup fixture lab ${{ github.ref_name }}" `
+            --notes "Windows build of the three-tab console. Unsigned: SmartScreen will say `"Windows protected your PC`" — choose More info, then Run anyway. It listens on 127.0.0.1 only, writes var\ next to itself, and ships no installer."
