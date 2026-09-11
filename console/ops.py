@@ -459,20 +459,43 @@ def job_accounts_info(settings: Settings, kind: str, limit: int, use_roster: boo
         conn = sqlite3.connect(settings.db)
         try:
             rows = roster_mod.rows_for_export(conn, listed, password=settings.test_password, limit=limit)
+            unknown = []
+            if listed is not None:
+                # Two different reasons a listed line yields nothing, measured apart: a name no
+                # fixture row has is a stale or hand-edited file, a name with a row is an account
+                # whose own status gets it refused. Reported as one number, the first sends
+                # somebody hunting for a verification state that does not exist.
+                have = {i.lower() for i in roster_mod.fixture_identities(conn)}
+                unknown = [i for i in listed if i.lower() not in have]
         finally:
             conn.close()
         if not rows:
-            raise RuntimeError("nothing to export: no active fixture accounts in that selection")
+            raise RuntimeError("nothing to export: no active fixture accounts in that selection"
+                               + (f" — and {len(unknown)} of the {len(listed)} listed names match no "
+                                  f"fixture account at all, so that file is stale: Settings > "
+                                  f"Rewrite file from fixture, or Sync to drop them" if unknown else ""))
         stem = Path(settings.account_list).with_suffix("")
         out = Path(str(stem) + ("-tokens.txt" if kind == "token" else "-userpass.txt"))
         report = roster_mod.write_export(out, kind, rows)
         if listed is not None and len(listed) > len(rows):
             # rows_for_export only hands back accounts that can authenticate, so a file
             # shorter than the roster is expected — say so instead of letting the difference
-            # read as a bug
-            report["skipped_inactive"] = len(listed) - len(rows)
-            job.say(f"{report['skipped_inactive']} listed account(s) are not active (pending "
-                    f"verification or banned), so there is no credential to write for them")
+            # read as a bug, and say which of the two reasons it is
+            known = len(listed) - len(unknown)
+            report["skipped_unknown"] = len(unknown)
+            if unknown:
+                job.say(f"{len(unknown)} listed line(s) match no fixture account at all (e.g. "
+                        f"{', '.join(unknown[:3])}) — a stale or hand-edited list, not an account "
+                        f"to fix: Settings > Rewrite file from fixture, or Sync to drop them")
+            if not limit:  # with a cap set, the un-written ones are the cap's doing, not a status
+                report["skipped_inactive"] = max(0, known - len(rows))
+                if report["skipped_inactive"]:
+                    job.say(f"{report['skipped_inactive']} listed account(s) are not active "
+                            f"(pending verification or banned), so there is no credential to "
+                            f"write for them")
+            elif limit:
+                job.say(f"the max-lines cap ({limit}) stopped the export, so further accounts "
+                        f"were neither written nor skipped for a reason")
         job.say(f"{kind}: {report['written']} line(s) -> {report['path']}"
                 + (f"  ({report['skipped_no_session']} skipped: no live session)"
                    if report["skipped_no_session"] else ""))

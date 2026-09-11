@@ -1114,6 +1114,45 @@ class RosterTest(unittest.TestCase):
                     self.assertNotIn(self.settings.test_password, secret,
                                      "the token export is not a password export with a new name")
 
+    def test_a_stale_line_is_reported_as_stale_not_as_inactive(self) -> None:
+        """A hand-edited `accounts.txt` drifts from the fixture in two directions, and the fix for
+        each is elsewhere: a name no row has means the file is stale (Rewrite/Sync), a name with a
+        row means that account's own status refuses a credential. Before this split both were one
+        number, and 40 leftover lines were reported as "41 accounts are not active" -- a sentence
+        that sends the operator looking for a verification state that does not exist."""
+        ghosts = ["ghost0", "ghost1", "ghost2"]
+        roster.write_roster(self.roster_path, roster.fixture_identities(self.conn()))
+        c = self.conn()
+        listed = roster.read_roster(self.roster_path).identities
+        active = int(c.execute("SELECT COUNT(*) n FROM users WHERE status='active'").fetchone()["n"])
+        c.close()
+        roster.write_roster(self.roster_path, [*ghosts, *listed])
+
+        job = ops.Job(id=9, kind="i")
+        out = ops.job_accounts_info(self.settings, "userpass", 0, use_roster=True)(job)
+        self.assertEqual(out["written"], active, "the ghosts add nothing to the file and hide nothing")
+        self.assertEqual(out["skipped_unknown"], len(ghosts))
+        self.assertEqual(out["skipped_inactive"], len(listed) - active,
+                         "only real accounts' statuses may be called inactive")
+        said = " ".join(job.log)
+        self.assertIn("match no fixture account at all", said)
+        self.assertIn("stale or hand-edited", said, "the log has to name the remedy, not just the count")
+        self.assertIn("not active (pending verification or banned)", said)
+
+        # a cap is the cap's doing, so it must not be dressed up as an account status
+        capped = ops.job_accounts_info(self.settings, "userpass", 1, use_roster=True)(ops.Job(id=10, kind="i"))
+        self.assertEqual(capped["written"], 1)
+        self.assertNotIn("skipped_inactive", capped, "an un-written account is not an inactive one")
+        self.assertEqual(capped["skipped_unknown"], len(ghosts))
+
+        # a file of nothing but ghosts says so, rather than reporting an empty selection
+        roster.write_roster(self.roster_path, ghosts)
+        with self.assertRaises(RuntimeError) as box:
+            ops.job_accounts_info(self.settings, "userpass", 0, use_roster=True)(ops.Job(id=11, kind="i"))
+        message = str(box.exception)
+        self.assertIn("3 of the 3 listed names match no fixture account", message)
+        self.assertIn("stale", message)
+
     def test_inactive_accounts_are_never_exported(self) -> None:
         c = self.conn()
         active = int(c.execute("SELECT COUNT(*) n FROM users WHERE status='active'").fetchone()["n"])

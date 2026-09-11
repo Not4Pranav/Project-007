@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 202 tests, no install step
+make test      # 203 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -486,6 +486,18 @@ anything is sent and reported, and an account that cannot log in (pending verifi
 banned) is skipped rather than half-joined. That is why the list carries inactive accounts:
 see the account list below.
 
+The two ways a hand-edited `accounts.txt` can be longer than what gets exported are counted
+apart, because they are fixed in different places. A file holding 40 lines left by an older
+version plus 5 real accounts (1 of them still pending verification) exports 4 lines and reports
+`{"written": 4, "skipped_unknown": 40, "skipped_inactive": 1}` — stale lines in one field,
+refused accounts in the other — and the log names the remedy for each: *Rewrite file from fixture*
+or *Sync* for the stale ones (measured: `{"written": 5, "path": "var/accounts.txt"}`, after which
+the list reports 5 lines and no unknowns), nothing to do for the pending account except verify it
+in your own app. Until this split both numbers arrived as `skipped_inactive: 41` under a line
+asserting they were "not active (pending verification or banned)", which pointed at a status no
+row had. With a `max lines` cap the report omits `skipped_inactive` entirely and says the cap
+stopped the export, because un-written is not the same as un-usable.
+
 Undo is a button, not a scheduler. The join job returns the `user_id`s it created rows for,
 and *Leave* replays `POST /servers/<id>/leave` over exactly those ids (measured:
 `{"server_id": 1, "left": 3, "skipped": 0}`). `left_ts` is set and the row stays — a fixture
@@ -580,7 +592,7 @@ does not exist yet**, then does nothing on every later start. The `db`, `api_por
 knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
 or base-URL flag to point at somebody else's system.
 
-The suite behind all of this is `tests/test_console.py` (62 tests: the settings rules, the
+The suite behind all of this is `tests/test_console.py` (63 tests: the settings rules, the
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in
