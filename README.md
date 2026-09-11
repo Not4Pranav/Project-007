@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 189 tests, no install step
+make test      # 190 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -355,7 +355,7 @@ Not a brag, a workflow demo — both were invisible without running it under loa
 with three tabs. It is not a second engine: every button runs the same module the CLI
 runs, and the Generate tab prints that command before running it — the preview and the
 job are built by the same function, so the preview cannot lie about what will happen.
-The page is 21,441 bytes of inline HTML/CSS/JS (21,416 characters) with no build step
+The page is 21,484 bytes of inline HTML/CSS/JS (21,459 characters) with no build step
 and no asset server.
 
 | tab | what it is for |
@@ -520,11 +520,11 @@ does not exist yet**, then does nothing on every later start. The `db`, `api_por
 knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
 or base-URL flag to point at somebody else's system.
 
-The suite behind all of this is `tests/test_console.py` (50 tests: the settings rules, the
+The suite behind all of this is `tests/test_console.py` (51 tests: the settings rules, the
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in
-`tests/test_mockapi.py`, and the repo is at 189 under `make test`.
+`tests/test_mockapi.py`, and the repo is at 190 under `make test`.
 
 ## Limits, honestly
 

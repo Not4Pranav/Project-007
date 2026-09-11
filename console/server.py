@@ -229,13 +229,14 @@ const FIELDS=[
  ["db","text"],["accounts_dir","text"],["users","number"],["days","number"],["seed","number"],
  ["bots","number"],["servers","number"],["events","number"],["hash_algo","select:sha256_fast,pbkdf2_sha256"],
  ["pbkdf2_iterations","number"],["min_password_length","number"],["register_domain","text"],
- ["test_password","text"],["fresh","bool"],
+ ["test_password","text"],["write_mode","select:append,replace"],["account_list","text"],
+ ["bootstrap_accounts","number"],
  ["api_port","number"],["console_port","number"],["stages","text"],["slo","text"],["warmup_seconds","number"],
  ["rate_limit_per_min","number"],["login_rate_limit_per_min","number"],["join_rate_limit_per_min","number"],
  ["max_inflight","number"],["block_disposable","bool"],["require_email_verify","bool"],["latency_ms","number"]];
 const GEN=[["users","number"],["days","number"],["seed","number"],["bots","number"],["servers","number"],
  ["events","number"],["hash_algo","select"],["min_password_length","number"],["register_domain","text"],
- ["db","text"],["fresh","bool"]];
+ ["db","text"],["write_mode","select:append,replace"]];
 const $=(s)=>document.querySelector(s);
 function el(tag,attrs,kids){const n=document.createElement(tag);
  for(const k in attrs){if(k==='text')n.textContent=attrs[k];else if(k==='html')n.innerHTML=attrs[k];

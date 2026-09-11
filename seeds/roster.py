@@ -23,9 +23,9 @@ COMMENT_LINES = (
     "# Signup fixture roster — one username or email per line. Blank lines and",
     "# anything starting with # are ignored.",
     "#",
-    "# This file decides which fixture accounts the console may use. Remove a line and run",
-    "# Settings > Sync account list to delete that account from the database, or click",
-    "# Rewrite from fixture to make the file match the database again.",
+    "# This file decides which fixture accounts the console may use. Remove a line and press",
+    "# Settings > \"Sync: delete what the file omits\" to drop that account from the database,",
+    "# or \"Rewrite file from fixture\" to make the file match the database again.",
     "# No passwords and no tokens are stored here, on purpose.",
 )
 
@@ -212,7 +212,7 @@ def write_export(path: str | Path, kind: str, rows: list[tuple[str, str, str]]) 
         lines.append(f"{username}:{secret}")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join([*note, "", *lines]) + ("\n" if lines else "\n"))
+    path.write_text("\n".join([*note, "", *lines]) + "\n")
     os.chmod(path, 0o600)
     return {"path": str(path), "written": len(lines), "skipped_no_session": missing, "kind": kind}
 

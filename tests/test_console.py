@@ -12,6 +12,7 @@ Three invariants this file exists to keep:
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import json
 import re
@@ -759,6 +760,19 @@ class RosterTest(unittest.TestCase):
                          "a rebuilt fixture must leave a list of the accounts it now has")
         self.assertEqual(after["roster_total"], len(all_names))
         conn.close()
+
+    def test_every_setting_is_editable_in_the_tab(self) -> None:
+        """The tab renders `FIELDS`, so a field added to the dataclass without an entry is a
+        knob nobody can turn — and a removed one leaves a control that saves "ignored
+        (unknown setting)" forever. `fresh` sat in the page as a checkbox for exactly one
+        round after `write_mode` replaced it."""
+        from console.server import PAGE
+
+        block = PAGE[PAGE.index("const FIELDS=["):PAGE.index("];", PAGE.index("const FIELDS=["))]
+        shown = set(re.findall(r'\["([a-z0-9_]+)"', block))
+        real = {f.name for f in dataclasses.fields(Settings)} - {"unknown"}
+        self.assertEqual(shown & real, real, f"not editable in Settings: {sorted(real - shown)}")
+        self.assertEqual(sorted(shown - real), [], f"the page still offers removed settings: {sorted(shown - real)}")
 
     def test_write_mode_picks_the_seeder_flag(self) -> None:
         append = Settings(write_mode="append").base_argv()
