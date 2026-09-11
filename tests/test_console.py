@@ -633,6 +633,57 @@ class JoinFlowTest(unittest.TestCase):
             self.run_job(ops.job_leave(self.settings, self.public, []))
         self.assertIn("no user ids", str(ctx.exception))
 
+    def test_a_pasted_link_joins_and_a_private_room_uses_its_own_code(self) -> None:
+        """Link in, memberships out — and the only code that opens a private room is the one
+        already in your database, never a code from outside."""
+        c = self.conn()
+        public = c.execute("SELECT id, slug FROM servers WHERE id=?", (self.public,)).fetchone()
+        priv = c.execute("SELECT id, slug FROM servers WHERE id=?", (self.priv,)).fetchone()
+        c.close()
+        self.assertFalse(public["slug"] is None)
+        stub = SimpleNamespace(settings_path=TMP / "unused.json")
+
+        link = f"http://127.0.0.1:{self.settings.api_port}/servers/{public['slug']}"
+        built = Handler._build(stub, "join", {"server_link": link, "source": "roster", "limit": 2},
+                              self.settings)
+        roster.write_roster(Path(self.settings.account_list), self.active_names(2))
+        result, job = self.run_job(built)
+        self.assertEqual(result["server_id"], self.public, (result, job.log[-2:]))
+        self.assertEqual(result["counts"].get("joined"), 2, result)
+        self.assertFalse(result["invited"], "a public room needs no code")
+
+        # private, without the code: the fixture refuses, and says what would satisfy it
+        roster.write_roster(Path(self.settings.account_list), self.active_names(2))
+        result, job = self.run_job(Handler._build(stub, "join", {
+            "server_link": f"/servers/{priv['id']}", "source": "roster", "limit": 2}, self.settings))
+        self.assertEqual(result["server_id"], int(priv["id"]), result)
+        self.assertEqual(result["counts"], {"refused": 2}, (result, job.log[-2:]))
+        self.assertIn("gates a private room on the row's own slug", " ".join(job.log))
+        c = self.conn()
+        members = int(c.execute("SELECT COUNT(*) FROM memberships WHERE server_id=?",
+                               (self.priv,)).fetchone()[0])
+        c.close()
+        self.assertEqual(members, 0, "a refusal must not have written a membership")
+
+        # the same room, with its own slug supplied: joined, and the code came from the row
+        roster.write_roster(Path(self.settings.account_list), self.active_names(2))
+        result, job = self.run_job(Handler._build(stub, "join", {
+            "server_link": f"/servers/{priv['slug']}", "invite": priv["slug"],
+            "source": "roster", "limit": 2}, self.settings))
+        self.assertEqual(result["server_id"], int(priv["id"]), result)
+        self.assertEqual(result["counts"].get("joined"), 2, (result, job.log[-2:]))
+        self.assertTrue(result["invited"], "the join carried the row's own invite code")
+        self.assertIn("invite code", " ".join(job.log))
+        self.run_job(ops.job_leave(self.settings, int(priv["id"]), result["joined_user_ids"]))
+
+    def active_names(self, n: int) -> list[str]:
+        c = self.conn()
+        try:
+            return [r[0] for r in c.execute(
+                "SELECT username FROM users WHERE status='active' ORDER BY id DESC LIMIT ?", (n,))]
+        finally:
+            c.close()
+
     def test_join_from_the_roster_file(self) -> None:
         """Option B "accounts from the list": the roster is the selection, and a name in it
         that the fixture no longer knows is skipped rather than attempted."""
@@ -708,6 +759,94 @@ class JoinFlowTest(unittest.TestCase):
         total = int(c.execute("SELECT COUNT(*) n FROM memberships").fetchone()["n"])
         c.close()
         self.assertEqual(status["tables"]["memberships"], total)
+
+
+class ResolveServerTest(unittest.TestCase):
+    """Option B's room field takes whatever shape you have — id, slug, name, or the link your
+    own app prints — and every one of them has to end up as a row of *this* fixture."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.db = seed_db("resolve-server", users=20, inject_bots=0)
+        cls.conn = sqlite3.connect(cls.db)
+        cls.conn.row_factory = sqlite3.Row
+        row = cls.conn.execute("SELECT id, name, slug FROM servers ORDER BY id LIMIT 2").fetchall()
+        cls.first, cls.second = row[0], row[1]
+        # an intentional collision: one room named after another room's slug
+        cls.conn.execute("UPDATE servers SET name=? WHERE id=?", (cls.first["slug"], cls.second["id"]))
+        cls.conn.commit()
+        cls.settings = Settings(db=str(cls.db), api_port=8000)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.conn.close()
+
+    def test_every_local_shape_hits_the_same_row(self) -> None:
+        sid, slug, name = int(self.first["id"]), self.first["slug"], self.first["name"]
+        for text, how in ((str(sid), "id"), (slug, "slug"), (slug.upper(), "slug"),
+                          (name, "name"), (f"/servers/{slug}", "link->slug"),
+                          (f"http://127.0.0.1:8000/servers/{slug}", "link->slug"),
+                          (f"http://localhost:8000/servers/{sid}/", "link->id"),
+                          (f"http://127.0.0.1:8000/api/servers/{sid}", "link->id")):
+            with self.subTest(text=text):
+                got = ops.resolve_server(self.settings, text)
+                self.assertEqual(got["server_id"], sid)
+                self.assertEqual(got["matched_by"], how)
+
+    def test_a_host_this_tool_cannot_reach_is_refused_before_any_lookup(self) -> None:
+        """The message names the host it refused, so it reads as a boundary and not as a
+        typo'd slug."""
+        for text in ("https://discord.com/invite/xyz", "http://example.com:8000/servers/1",
+                     "https://127.0.0.1.evil.test/servers/1"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError) as ctx:
+                    ops.resolve_server(self.settings, text)
+                msg = str(ctx.exception)
+                self.assertIn("only joins rooms of its own fixture", msg)
+                self.assertNotIn("no room matching", msg, "a foreign host is not a missing room")
+
+    def test_a_loopback_link_to_another_port_is_refused_too(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            ops.resolve_server(self.settings, "http://127.0.0.1:9999/servers/1")
+        self.assertIn("the fixture's API is on 8000", str(ctx.exception))
+
+    def test_a_slug_and_a_name_that_collide_resolve_to_the_slug(self) -> None:
+        """The collision I set up on purpose: row 2 is *named* row 1's slug. Slug wins, and the
+        report says which route it took, so the pick is visible rather than lucky."""
+        got = ops.resolve_server(self.settings, self.first["slug"])
+        self.assertEqual(got["server_id"], int(self.first["id"]))
+        self.assertEqual(got["matched_by"], "slug")
+        self.assertEqual(got["candidates"], 2, "two rows did match the text; one of them by name")
+
+    def test_unknown_names_and_true_ambiguity_refuse(self) -> None:
+        with self.assertRaises(ValueError) as ctx:
+            ops.resolve_server(self.settings, "room-404")
+        self.assertIn("the fixture's own servers are the only ones", str(ctx.exception))
+        self.assertIn(str(self.db), str(ctx.exception), "say which database was searched")
+        twin = int(self.second["id"]) + 1
+        was = self.conn.execute("SELECT name FROM servers WHERE id=?", (twin,)).fetchone()
+        self.assertIsNotNone(was, "the seeder must have made a third room for this to be a tie")
+        # two rooms sharing a name and no slug anywhere near it: nothing can break the tie, so
+        # the resolver refuses and lists the candidates instead of picking the lowest id
+        tied = "Twin Peak Room"
+        self.conn.execute("UPDATE servers SET name=? WHERE id IN (?,?)", (tied, int(self.second["id"]), twin))
+        self.conn.commit()
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                ops.resolve_server(self.settings, tied)
+            self.assertIn("matches 2 rooms", str(ctx.exception))
+            self.assertIn(str(self.second["id"]), str(ctx.exception), "the refusal names the candidates")
+        finally:
+            self.conn.execute("UPDATE servers SET name=? WHERE id=?", (self.second["name"], int(self.second["id"])))
+            self.conn.execute("UPDATE servers SET name=? WHERE id=?", (was[0], twin))
+            self.conn.commit()
+
+    def test_empty_input_is_its_own_message(self) -> None:
+        for blank in ("", "   ", None):
+            with self.subTest(blank=blank):
+                with self.assertRaises(ValueError) as ctx:
+                    ops.resolve_server(self.settings, blank)
+                self.assertIn("no room named", str(ctx.exception))
 
 
 class RosterTest(unittest.TestCase):

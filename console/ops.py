@@ -7,10 +7,12 @@ Nothing here parses HTTP or renders HTML. Two reasons, both load-bearing:
    is the contract. Keeping it in one module makes "the UI can only do what these
    functions do" checkable by reading one file.
 
-Consequently there is no path anywhere that accepts a URL, a SQL fragment, a shell
-string, or a module name from the browser. The load target is always
-`Settings.api_url()` (loopback, the API this process started), and seed/export paths
-are validated in `console.settings`.
+Consequently there is no path anywhere that takes a SQL fragment, a shell string, or a
+module name from the browser, and the request target is always `Settings.api_url()`
+(loopback, the API this process started) — seed/export paths are validated in
+`console.settings`. The one URL-*shaped* input is Option B's room field, and it is parsed
+as a name to look up in your own `servers` table: a host that is not this loopback API is
+refused before the lookup, because there is no other target for a job here to reach.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import traceback
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from load.accounts import parse_file
 from load.engine import main as load_main
@@ -659,19 +662,95 @@ def usable_accounts(settings: Settings, source: str, token_file: str, limit: int
     raise RuntimeError(f"unknown account source {source!r}")
 
 
+LOCAL_LINK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+def resolve_server(settings: Settings, text: str) -> dict:
+    """Turn whatever the operator typed for the target room into a row of *their own* fixture.
+
+    Accepted, all local: a numeric id, the room's `slug`, its name, or a link to the room as
+    this fixture would print it (`http://127.0.0.1:8000/servers/amber-lantern`, `/servers/7`,
+    even a bare `amber-lantern`). The candidate is looked up in `settings.db`'s `servers`
+    table and nothing else — so this names a room you operate, and cannot name one you do
+    not. A link whose host is not the loopback API the console talks to is refused *before*
+    the lookup, because the lookup would be a lie about where the job is going: there is no
+    outbound target in this tool to point at.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("no room named: put an id, a slug, a name, or the fixture's own link in it")
+    candidate = raw
+    matched_by = "text"
+    if "://" in raw:
+        parts = urlsplit(raw)
+        host = (parts.hostname or "").lower()
+        if host not in LOCAL_LINK_HOSTS:
+            raise ValueError(
+                f"that link points at {host or '?'} — this console only joins rooms of its own "
+                f"fixture, reached at {settings.api_url()}; a room somebody else operates is "
+                f"not something this tool drives, at any port and in any form")
+        if parts.port is not None and parts.port != settings.api_port:
+            raise ValueError(f"that link names port {parts.port}, but the fixture's API is on "
+                             f"{settings.api_port}; the job would not reach the room you pasted")
+        segments = [s for s in parts.path.split("/") if s]
+        matched_by = "link"
+    elif "/" in raw:
+        segments = [s for s in raw.split("/") if s]
+        matched_by = "link"
+    else:
+        segments = []
+    if segments:
+        candidate = unquote(segments[-1]).strip()
+    if not candidate:
+        raise ValueError(f"no room id or slug in {raw!r}")
+
+    conn = sqlite3.connect(f"file:{Path(settings.db).resolve()}?mode=ro", uri=True, timeout=5)
+    try:
+        # -1 rather than a CAST of the text: a non-numeric candidate must not match row 0 by
+        # accident, and ids start at 1
+        rows = conn.execute(
+            "SELECT id, name, slug, capacity, private FROM servers "
+            " WHERE slug = ? COLLATE NOCASE OR lower(name) = ? OR id = ?",
+            (candidate, candidate.lower(), int(candidate) if candidate.isdigit() else -1)).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot read the server list from {settings.db}: {exc}") from exc
+    finally:
+        conn.close()
+    if not rows:
+        raise ValueError(f"no room matching {candidate!r} in {settings.db}: the fixture's own "
+                         f"servers are the only ones this can drive — the picker beside this "
+                         f"field lists them")
+    by_id = [r for r in rows if candidate.isdigit() and int(r[0]) == int(candidate)]
+    by_slug = [r for r in rows if str(r[2]).lower() == candidate.lower()]
+    picked = (by_id or by_slug or list(rows))[0]
+    if len(rows) > 1 and not by_id and not by_slug:
+        raise ValueError(f"{candidate!r} matches {len(rows)} rooms (ids "
+                         f"{', '.join(str(r[0]) for r in rows[:6])}): use the id or the slug")
+    how = "id" if by_id else ("slug" if by_slug else "name")
+    return {"server_id": int(picked[0]), "name": picked[1], "slug": picked[2], "capacity": picked[3],
+            "private": bool(picked[4]), "matched_by": f"link->{how}" if matched_by == "link" else how,
+            "candidates": len(rows)}
+
+
 def job_join(settings: Settings, server_id: int, source: str, token_file: str, limit: int,
-              pacing_ms: float) -> Callable[[Job], dict]:
+              pacing_ms: float, invite: str = "") -> Callable[[Job], dict]:
     """Join `server_id` as each selected account, through the mock API's own route.
 
-    `server_id` addresses a row in `settings.db` — that is the whole difference between
-    this and "join a server out there": the console has no field that takes a URL, an
-    invite link, or an external identifier of any kind.
+    `server_id` addresses a row in `settings.db`, which is the whole difference between this
+    and "join a server out there": the identifier is looked up in the fixture you operate, and
+    the request goes to the fixed loopback URL — there is no field anywhere that reaches a
+    host this tool does not run. `invite` is that row's own code, for the fixture's private
+    gate; it is read out of your database, not off somebody's invite link.
     """
     def run(job: Job) -> dict:
         if not API.running:
             raise RuntimeError("the mock API is not running — start it from the same tab")
         accounts = usable_accounts(settings, source, token_file, limit)
         job.say(f"{len(accounts)} account(s) via {source} joining server {server_id}")
+        hint_given = False
+        if invite:
+            shown = invite if len(invite) <= 6 else f"{invite[:4]}…({len(invite)} chars)"
+            job.say(f"each join carries the room's own invite code: {shown}")
         client = ApiClient(settings.api_url(), timeout=10.0)
         counts: dict[str, int] = {}
         joined: list[int] = []
@@ -682,7 +761,8 @@ def job_join(settings: Settings, server_id: int, source: str, token_file: str, l
             for user_id, token in accounts:
                 if pacing_ms:
                     time.sleep(pacing_ms / 1000.0)
-                resp = client.request("POST", f"/servers/{server_id}/join", {},
+                resp = client.request("POST", f"/servers/{server_id}/join",
+                                      {"invite": invite} if invite else {},
                                       extra_headers={"Authorization": f"Bearer {token}"})
                 key = outcome_labels.get(resp.status, f"http-{resp.status}")
                 counts[key] = counts.get(key, 0) + 1
@@ -691,10 +771,17 @@ def job_join(settings: Settings, server_id: int, source: str, token_file: str, l
                     joined.append(user_id)
                 if key in ("refused", "no-such-server", "unauthenticated"):
                     job.say(f"user {user_id}: {key} {str(resp.data)[:90]}")
+                    if key == "refused" and not invite and not hint_given:
+                        hint_given = True
+                        job.say("this fixture gates a private room on the row's own slug — paste "
+                                "that value in the invite box (SELECT slug FROM servers WHERE id="
+                                f"{server_id}), or join a public room; the room listing hides it "
+                                "for private rows so the gate stays a gate")
         finally:
             client.close()
         latencies.sort()
         return {"server_id": server_id, "accounts": len(accounts), "counts": counts,
+                "invited": bool(invite),
                 "p50_ms": round(latencies[len(latencies) // 2], 2) if latencies else 0.0,
                 "max_ms": round(latencies[-1], 2) if latencies else 0.0,
                 "joined_user_ids": joined[:500]}

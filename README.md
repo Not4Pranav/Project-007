@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 190 tests, no install step
+make test      # 197 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -46,7 +46,11 @@ what the tooling below is for — every fixture here lands in a SQLite file you 
 
 That includes the adjacent shapes: no driving accounts into a server via an invite link
 someone else controls, and no join-then-leave-on-a-timer scheduling (it exists to move a
-crowd through a room before moderation lands). The `--accounts-file` dump below is the
+crowd through a room before moderation lands). Option B below does take a *link* in its room
+box, because a link is how people write down which room they mean — but it is parsed as a way
+of naming a row of your own `servers` table, a host that is not the fixture's loopback API is
+refused before any lookup happens, and the request it makes is always the fixed local one. The
+`--accounts-file` dump below is the
 inverse of a `login.txt` credential file — identity plus a revocable session on *your*
 target, never a password, and refuses to write anything for a host that is not local or
 reserved.
@@ -355,7 +359,7 @@ Not a brag, a workflow demo — both were invisible without running it under loa
 with three tabs. It is not a second engine: every button runs the same module the CLI
 runs, and the Generate tab prints that command before running it — the preview and the
 job are built by the same function, so the preview cannot lie about what will happen.
-The page is 21,484 bytes of inline HTML/CSS/JS (21,459 characters) with no build step
+The page is 22,628 bytes of inline HTML/CSS/JS (22,597 characters) with no build step
 and no asset server.
 
 | tab | what it is for |
@@ -403,12 +407,30 @@ are the same kind of object and behave the same way. The two exports above are d
 a list of files whose tokens can be spent and revoked, so a password file must not be
 selectable there even though `accounts-userpass.txt` passes the filename rule.
 
-**Option B — server join.** Pick a server from your own fixture — the dropdown is
-`GET /servers` (id, name, live member count, capacity, private flag) — pick where the
-accounts come from (the account list, a token dump from a previous run, or the newest fixture
-logins), how many, and the pacing; then *Join* sends each account through the mock API's own
-`POST /servers/<id>/join`, one at a time. The result is the API's answer per account, not a
-hope:
+**Option B — server join.** Name the room in the box — `7`, `wild-lantern`, `Wild Lantern`,
+`/servers/wild-lantern`, or the whole link your own app prints,
+`http://127.0.0.1:8000/servers/wild-lantern` — and it is resolved as a row of your fixture's
+`servers` table. Every shape lands on the same room, and the report says which route it took
+(`matched_by: link->slug`). The dropdown beside the box lists the rooms the fixture actually
+has (id, name, live member count, capacity, private flag, and its slug for the public ones) and
+is the fallback when the box is empty. A link to anywhere else is refused before the lookup:
+
+```
+that link points at discord.com — this console only joins rooms of its own fixture, reached at
+http://127.0.0.1:8052; a room somebody else operates is not something this tool drives, at any
+port and in any form
+```
+
+That is the whole boundary, and it is a lookup rather than a promise: there is no way for the
+box to reach a room that this database does not describe. Two names tied on one text (a slug
+of one room that is another room's name, say) resolve to the slug owner; two rooms tied on a
+name refuse and list their ids, because guessing which room to fill is not a thing a bulk join
+should do quietly.
+
+Pick where the accounts come from (the account list, a token dump from a previous run, or the
+newest fixture logins), how many, and the pacing; then *Join server* sends each account through
+the mock API's own `POST /servers/<id>/join`, one at a time. The result is the API's answer per
+account, not a hope:
 
 ```
 {"server_id": 1, "accounts": 3, "counts": {"joined": 3}, "p50_ms": 43.99, "max_ms": 45.08,
@@ -421,6 +443,12 @@ returns `{"already-member": 3}` and adds no rows; a `private` row returns `{"ref
 private rows so a listing cannot hand out the code, and there is no field anywhere that takes
 an invite code from outside); a `capacity=1` row given three accounts returns
 `{"joined": 1, "refused": 2}` and leaves exactly one live membership. Set
+`private=1` on a row and join it without a code: `{"refused": 2}`, `joined_user_ids: []`, zero
+rows written, and the log names the gate — `this fixture gates a private room on the row's own
+slug`. Paste that row's `slug` into the invite box and the same join reports
+`{"joined": 2}, "invited": true`; paste a wrong code and it refuses again. The console will not
+fill the box for you, and the room listing hides a private row's slug: the gate is your app's,
+so it stays observable instead of being routed around.
 `join_rate_limit_per_min` to 1 in Settings, restart the API so it re-reads config, and a
 6-account join reports `{"already-member": 1, "throttled": 5}` — throttling shows up as a
 count instead of quietly becoming a success.
@@ -441,10 +469,12 @@ newest join that created rows — and refuses with a named reason only when no j
 session created anything. Clicking it twice is an honest no-op (`{"left": 0, "skipped": 3}`),
 because those ids are already gone, not an error.
 
-There is no link field in Option B, on purpose. A URL there would point the tool at somebody
-else's room, and moving a crowd of accounts into a server you do not operate is the thing
-this repo declines to do; `--bootstrap`'s tab, the CLI and the settings file all enforce the
-same boundary (see below).
+A pasted link is therefore a *name*, never a destination. Nothing in Option B can point the
+tool at a room it does not already know how to reach: the target is the fixed loopback URL, the
+room must be a row of your `settings.db`, and leaving is the explicit button over the ids the
+join reported rather than a countdown. That combination is what makes it usable as a test of
+your own join path — capacity, the private gate, idempotence, throttling — and what keeps the
+bulk-joining shape out of it.
 
 ### Settings, and what the console refuses
 
@@ -494,8 +524,10 @@ removes.
 
 Two things no tab, no field, and no command-line flag will do:
 
-* **address anything that is not `127.0.0.1`.** There is no base-URL, host, or invite-link
-  field. `Settings.api_url()` builds the target from the port number alone
+* **address anything that is not `127.0.0.1`.** There is no base-URL or host field, and the one
+  link-shaped box in the UI is parsed for a room name, not a destination: a host other than the
+  loopback API (or a loopback link naming the wrong port) is refused before any lookup, and the
+  request that does go out is built by `Settings.api_url()` from the port number alone
   (`http://127.0.0.1:<api_port>`), and `load.engine` keeps its own `local_target()` check
   for the same reason. This is the line in *What is not here*, enforced in the place where a
   URL would otherwise be typed.
@@ -520,11 +552,11 @@ does not exist yet**, then does nothing on every later start. The `db`, `api_por
 knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
 or base-URL flag to point at somebody else's system.
 
-The suite behind all of this is `tests/test_console.py` (51 tests: the settings rules, the
+The suite behind all of this is `tests/test_console.py` (58 tests: the settings rules, the
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in
-`tests/test_mockapi.py`, and the repo is at 190 under `make test`.
+`tests/test_mockapi.py`, and the repo is at 197 under `make test`.
 
 ## Limits, honestly
 

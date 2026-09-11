@@ -95,10 +95,13 @@ small{color:var(--dim)}
  </nav>
 </header>
 <main>
-<p class=tabs-note><b>Generator Mode</b> builds the accounts. <b>Operational Mode</b> drives them
-(the two options: <i>server join</i> and <i>account token file</i>) against the mock API this console
-starts. <b>Settings</b> holds the tool defaults both read. Everything is a loopback target and a
-fixture database — there is no field for a URL, an invite link, or a database outside <code>var/</code>.</p>
+<p class=tabs-note><b>Generator Mode</b> builds accounts and saves them alongside the ones already
+there. <b>Operational Mode</b> spends them: <i>Option A</i> gets accounts info out of the list
+(<code>user:pass</code> or <code>user:token</code>), <i>Option B</i> joins N of those accounts into a
+room of this fixture. <b>Settings</b> holds the defaults both read, and the account list itself.
+Everything targets the loopback API and a database under <code>var/</code>; the room box accepts a
+link, but reads it as the name of one of your own rows and refuses a host that is not the API
+above — a database outside <code>var/</code> is refused too.</p>
 
 <section id=gen class=on>
  <div class=card>
@@ -138,7 +141,7 @@ fixture database — there is no field for a URL, an invite link, or a database 
 
  <div class=card>
   <h2>Option A — accounts info</h2>
-  <p class=hint">Two files out of the account list: <code>user:pass</code> (the fixture's shared
+  <p class=hint>Two files out of the account list: <code>user:pass</code> (the fixture's shared
    password) or <code>user:token</code> (a live session of the mock API above). Both are written
    next to the roster at <code>0600</code>, both are local-only, and neither is a credential for
    any service you do not run.</p>
@@ -164,13 +167,18 @@ fixture database — there is no field for a URL, an invite link, or a database 
 
  <div class=card>
   <h2>Option B — server join</h2>
-  <p class=hint">Joins <i>this fixture's</i> servers, chosen by id, through
-   <code>POST /servers/&lt;id&gt;/join</code>. There is no link field: a URL here would point the
-   tool at somebody else's room, and that part is not what this is for. Membership lands in
+  <p class=hint>Joins <i>this fixture's</i> rooms through <code>POST /servers/&lt;id&gt;/join</code>.
+   Name the room however you like — its id, its slug, its name, or the link your own app prints
+   for it — and it is resolved as a row of your <code>settings.db</code>, which is the whole
+   boundary: a link whose host is not the loopback API above is refused before anything is
+   looked up, because a room somebody else operates is not what this tool drives. Membership lands in
    <code>memberships</code>, so your own queries, member lists and moderation queue have something
    to chew on, and <i>Undo</i> is a button over the ids the join reported — not a timer.</p>
   <div class=grid>
-   <div><label>server</label><select id=join-server></select></div>
+   <div><label>server: link, slug, name or id</label><input id=join-link type=text
+     placeholder="http://127.0.0.1:<port>/servers/&lt;slug&gt; — or just the slug"></div>
+   <div><label>or pick one (the box wins)</label><select id=join-server></select></div>
+   <div><label>invite code (private rooms)</label><input id=join-invite type=text placeholder=empty></div>
    <div><label>accounts from</label><select id=join-source>
      <option value=roster>the account list (accounts.txt)</option>
      <option value=token-file>a run's token dump</option><option value=fixture-logins>newest fixture logins</option>
@@ -281,8 +289,8 @@ function renderOps(){
  if(S.api.health&&S.api.health.users!==undefined)bits.push(['users',S.api.health.users]);
  bits.forEach(([k,v])=>kv.appendChild(el('span',{text:k+': '+v})));
  const servers=S.fixture.servers||[];
- fillSelect($('#join-server'),servers,[s=>s.id,s=>'#'+s.id+' '+s.name+'  ('+s.members+' members'+
-  (s.capacity!=null?'/'+s.capacity:'')+(s.private?', private':'')+')']);
+ fillSelect($('#join-server'),servers,[s=>s.id,s=>'#'+s.id+' '+s.name+(s.private?'  [private]'
+  :'  /'+s.slug)+'  ('+s.members+' members'+(s.capacity!=null?'/'+s.capacity:'')+')']);
  if(!servers.length)$('#join-server').appendChild(el('option',{value:'',text:'no servers — generate first'}));
  const dumps=S.fixture.dumps||[];
  fillSelect($('#join-dump'),dumps,[d=>d.name,d=>d.name+'  ('+d.tokens+' tokens)']);
@@ -341,9 +349,14 @@ async function submit(kind){const hosts={generate:'#gen-log',scan:'#gen-log',exp
   scope:$('#info-scope').value,limit:$('#info-limit').value};
  if(kind==='generate')payload.params=body();
  if(kind==='export')payload.params={tables:$('#exp-tables').value,formats:$('#exp-formats').value};
- if(kind==='join')payload.params={server_id:$('#join-server').value,source:$('#join-source').value,
+ if(kind==='join')payload.params={server_id:$('#join-server').value,server_link:$('#join-link').value,
+  invite:$('#join-invite').value,source:$('#join-source').value,
   token_file:$('#join-dump').value,limit:$('#join-limit').value,pacing_ms:$('#join-pace').value};
- if(kind==='leave')payload.params={server_id:$('#join-server').value};
+ if(kind==='leave'){// undo the room the last join actually hit, which may be one named by
+  // link rather than by the picker: the join job reports its id, so read it from there
+  payload.params={server_id:$('#join-server').value};
+  const j=S.jobs.find(x=>x.kind==='join'&&x.result&&x.result.server_id);
+  if(j)payload.params.server_id=String(j.result.server_id);}
  if(kind==='join'&&$('#join-source').value!=='token-file')payload.params.token_file='';
  if(kind==='load')payload.params={use_tokens:$('#load-tokens').checked?'newest':''};
  const r=await fetch('/api/job',{method:'POST',headers:{'content-type':'application/json'},
@@ -657,9 +670,19 @@ class Handler(BaseHTTPRequestHandler):
             if source not in ("roster", "token-file", "fixture-logins"):
                 raise ValueError("accounts must come from the roster file, a run's token dump, "
                                  "or fixture logins")
-            return ops.job_join(settings, num("server_id", 1, 1_000_000), source,
-                                 name_or("token_file"), num("limit", 1, 2000, 25),
-                                 num("pacing_ms", 0, 60000))
+            # The room may be named by link, slug, name or id, but every form resolves to a
+            # row of settings.db; the dropdown's id is only the fallback when the box is empty.
+            link = str(params.get("server_link") or "").strip()
+            invite = str(params.get("invite") or "").strip()
+            if link:
+                # no auto-fill of the invite code from the resolved row: a private room's slug
+                # is the fixture's gate, and a console that quietly supplies it makes the
+                # refusal path untestable. The operator pastes it, or the join reports refused.
+                server_id = int(ops.resolve_server(settings, link)["server_id"])
+            else:
+                server_id = num("server_id", 1, 1_000_000)
+            return ops.job_join(settings, server_id, source, name_or("token_file"),
+                                 num("limit", 1, 2000, 25), num("pacing_ms", 0, 60000), invite)
         if kind == "accounts-info":
             which = str(params.get("kind") or "userpass")
             if which not in ("userpass", "token"):
