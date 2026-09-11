@@ -1,21 +1,100 @@
 {
   "name": "rest-plus-graphql",
-  "_comment": "Sketch of a real-shaped target: JSON envelope, bearer capture, GraphQL POST, and a think-time pause. Point base_url at staging.",
+  "_comment": "Sketch of a real-shaped target: JSON envelope, bearer capture, GraphQL POST, think-time pause. Every op that reads captured state declares `requires`, so it skips until the auth op has run instead of sending 'Bearer '.",
   "base_url": "http://localhost:3000",
-  "headers": {"x-client": "loadtest", "authorization": "Bearer {{token}}"},
+  "headers": {
+    "x-client": "loadtest"
+  },
   "ops": [
-    {"name": "auth", "weight": 20, "method": "POST", "path": "/api/v1/auth/token",
-     "json": {"grant_type": "password", "username": "{{ident}}", "secret": "{{password}}"},
-     "expect": [200, 401], "capture": {"token": "data.access_token", "org": "data.org_id"}},
-    {"name": "list", "weight": 45, "method": "GET", "path": "/api/v1/items",
-     "query": {"page_size": "50", "after": "{{cursor}}", "org": "{{org}}"},
-     "expect": [200], "capture": {"cursor": "data.page_info.end_cursor"}},
-    {"name": "graphql", "weight": 25, "method": "POST", "path": "/graphql",
-     "json": {"query": "query Feed($first: Int!) { feed(first: $first) { edges { cursor node { id title } } } }",
-              "variables": {"first": 25}, "operationName": "Feed"},
-     "expect": [200], "capture": {"cursor": "data.feed.edges.-1.cursor"}},
-    {"name": "write", "weight": 5, "method": "POST", "path": "/api/v1/items",
-     "json": {"title": "load {{seq}} {{rand:99999}}", "org_id": "{{org}}"},
-     "expect": [201, 429], "think_ms": 250}
+    {
+      "name": "auth",
+      "weight": 20,
+      "method": "POST",
+      "path": "/api/v1/auth/token",
+      "json": {
+        "grant_type": "password",
+        "username": "{{ident}}",
+        "secret": "{{password}}"
+      },
+      "expect": [
+        200,
+        401
+      ],
+      "capture": {
+        "token": "data.access_token",
+        "org": "data.org_id"
+      }
+    },
+    {
+      "name": "list",
+      "weight": 40,
+      "method": "GET",
+      "path": "/api/v1/items",
+      "headers": {
+        "authorization": "Bearer {{token}}"
+      },
+      "query": {
+        "page_size": "50",
+        "after": "{{cursor}}",
+        "org": "{{org}}"
+      },
+      "requires": [
+        "token",
+        "org"
+      ],
+      "expect": [
+        200
+      ],
+      "capture": {
+        "cursor": "data.page_info.end_cursor"
+      }
+    },
+    {
+      "name": "graphql",
+      "weight": 25,
+      "method": "POST",
+      "path": "/graphql",
+      "headers": {
+        "authorization": "Bearer {{token}}"
+      },
+      "requires": [
+        "token"
+      ],
+      "json": {
+        "query": "query Feed($first: Int!) { feed(first: $first) { edges { cursor node { id title } } } }",
+        "variables": {
+          "first": 25
+        },
+        "operationName": "Feed"
+      },
+      "expect": [
+        200
+      ],
+      "capture": {
+        "cursor": "data.feed.edges.-1.cursor"
+      }
+    },
+    {
+      "name": "write",
+      "weight": 10,
+      "method": "POST",
+      "path": "/api/v1/items",
+      "headers": {
+        "authorization": "Bearer {{token}}"
+      },
+      "requires": [
+        "token",
+        "org"
+      ],
+      "json": {
+        "title": "load {{seq}} {{rand:99999}}",
+        "org_id": "{{org}}"
+      },
+      "expect": [
+        201,
+        429
+      ],
+      "think_ms": 250
+    }
   ]
 }

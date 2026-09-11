@@ -11,6 +11,8 @@ from load.scenarios import LoadOptions
 from mockapi.client import ApiClient
 from tests._support import RunningApi, seed_db
 
+ROOT = Path(__file__).resolve().parents[1]
+
 SPEC = {
     "name": "probe",
     "ops": [
@@ -91,6 +93,32 @@ class SpecTest(unittest.TestCase):
         picks = [scn.pick(rnd).name for _ in range(4000)]
         self.assertGreater(picks.count("login") / len(picks), 0.35)
         self.assertLess(picks.count("broken") / len(picks), 0.01, "weight 0 should essentially never fire")
+
+
+class ShippedExamplesTest(unittest.TestCase):
+    """The example specs are documentation you can run, so they are tested like code:
+    they must load, and no op may use captured state without `requires` guarding it.
+    Without that guard an example that looks fine on page 2 exits 3 (`{{org}}` before
+    any response has carried an org) — a confusing first experience of the feature."""
+
+    EXAMPLES = sorted((ROOT / "docs" / "examples").glob("*.load.json"))
+
+    def test_examples_exist(self) -> None:
+        self.assertTrue(self.EXAMPLES, "docs/examples vanished")
+
+    def test_examples_load_and_guard_captured_state(self) -> None:
+        for path in self.EXAMPLES:
+            spec = Spec.load(path)
+            self.assertTrue(spec.ops, path.name)
+            # `cursor` legitimately starts empty (page one has no cursor), so it is
+            # the one captured var an op may use unguarded.
+            captured = {var for op in spec.ops for var in op.capture} - {"cursor"}
+            for op in spec.ops:
+                blob = json.dumps([op.path, op.query, op.headers, op.body])
+                used = {var for var in captured if "{{" + var + "}}" in blob}
+                if used:
+                    self.assertTrue(set(op.requires) >= used,
+                                    f"{path.name}/{op.name} uses {sorted(used)} without `requires`")
 
 
 class ScenarioAgainstApiTest(unittest.TestCase):

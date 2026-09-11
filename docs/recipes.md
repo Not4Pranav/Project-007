@@ -220,6 +220,9 @@ Three rungs of strictness, and why each earns its keep:
 | gate | `--slo p95_ms=400,error_rate_pct=0.5` → exit 4 | CI fails on a real regression, not on `curl` flakiness |
 | spec | `--spec` with `expect` lists + `requires` | a 200-shaped failure: an endpoint that answers `200` with `{"errors":[...]}`, or an authed op silently running unauthenticated |
 
+Both files in `docs/examples/` are covered by a test that loads them and refuses any op
+which reads a captured variable without `requires`, so the copy-paste path stays runnable.
+
 `requires` exists for that second case: an op whose token was never captured is counted as
 `skipped` instead of firing a 401 that you then spend time explaining. If the spec can't
 resolve a `{{var}}` at all, the run ends with `spec_error` (exit 3) rather than sending an
