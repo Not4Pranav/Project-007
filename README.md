@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 139 tests, no install step
+make test      # 189 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -28,6 +28,9 @@ make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 | `seeds/export.py` | bulk CSV/JSONL artifacts + a generated Postgres loader, for staging and pytest |
 | `load/accounts.py` | per-worker account dump (identity + bearer token) so a run leaves browsable accounts behind |
 | `console/` | the three-tab control plane over those modules: Generator Mode, Operational Mode, Settings |
+| `seeds/roster.py` | the account list the operator edits: read, rewrite, sync (delete what is not listed), exports |
+| `run.bat` | Windows entry point: checks the interpreter, starts the console with `--bootstrap --open-browser` |
+| `build_exe.bat` | optional: builds `dist\SignupFixtureLab.exe` on Windows with PyInstaller |
 | `docs/recipes.md` | the wiring: Postgres import, pytest fixtures from JSONL, CI gate, spec-driven load |
 | `tests/` | the suite (`unittest`, no pytest needed) |
 | `var/` | generated databases and reports (gitignored) |
@@ -67,6 +70,30 @@ about 42s on two cores:
 ```
 timing: generate 12.5s  insert 29.8s  events 1,683,860  sessions 90,261
 ```
+
+### On Windows, by double-click
+
+`run.bat` sits in the repo folder. It finds `py -3` / `python` on `PATH`, refuses if the
+interpreter is older than 3.11, then runs:
+
+```
+python -m console --bootstrap --open-browser
+```
+
+which opens `http://127.0.0.1:8010/`. Anything you type after the script is passed through,
+so `run.bat --port 8090` works. `--bootstrap` is the first-run setup: with no fixture
+database yet it generates the configured number of accounts (Settings >
+`bootstrap_accounts`, 5 by default) and writes them to `var\accounts.txt`, so the tabs open
+with a usable account list instead of an empty one. It never touches an existing database —
+that flag is a no-op once `var\test.db` exists, and the Generator tab is how you add to it.
+
+`build_exe.bat` is the optional next step: it runs PyInstaller and produces
+`dist\SignupFixtureLab.exe`, one file you can copy wherever you work. It has to be run on
+Windows — PyInstaller is not a cross-compiler, so a binary built on Linux or macOS will not
+execute here. The `.exe` sets the same defaults `run.bat` passes (it has no place to type
+flags), and it still writes `var\` next to itself, so keep it somewhere writable.
+
+Neither one installs anything, needs admin rights, or opens a port beyond `127.0.0.1`.
 
 ## Why the fixture bothers being realistic
 
@@ -119,10 +146,20 @@ fixture hash  a6270147ec3fa1d8
 | `--events`, `--sessions`, `--no-activity` | activity tail volume |
 | `--test-password` | one shared fixture password; empty = random per account |
 | `--hash-algo`, `--pbkdf2-iterations` | hashing cost/semantics |
-| `--fresh` | rebuild in place instead of refusing |
+| `--fresh` | wipe the rows (schema stays) and rebuild from this seed |
+| `--append` | add a *new* cohort after the highest existing id, leaving every earlier row alone |
 
-It refuses to run against a database that already has users unless you pass
-`--fresh`, so a typo in `--db` costs you a rerun and not a table.
+It refuses to run against a database that already has users unless you pick one of those two,
+so a typo in `--db` costs you a rerun and not a table. Passing both is refused too: they
+contradict each other.
+
+`--append` is what the console's Generator Mode uses by default (Settings > `write mode`), and
+it is the difference between "grow the fixture" and "lose the accounts you have been editing":
+the second batch continues the id sequence, gets signup stamps in the last 24 hours rather than
+spread across the window, and leaves `servers`, `sessions` and every hand-written row from the
+first pass in place. Re-appending does not invent a second set of rooms. `meta.seed_params`
+describes the whole fixture afterwards (`users` = total, `last_batch` = this run,
+`appended: true`), which is what the report and the fixture hash read.
 
 **Schema** (`seeds/schema.sql`): `users`, `credentials`, `sessions`, `events`,
 `invite_edges`, `flags`, `meta`. Notable indexes: `users(signup_ts)`,
@@ -318,14 +355,14 @@ Not a brag, a workflow demo — both were invisible without running it under loa
 with three tabs. It is not a second engine: every button runs the same module the CLI
 runs, and the Generate tab prints that command before running it — the preview and the
 job are built by the same function, so the preview cannot lie about what will happen.
-The page is 17,363 bytes of inline HTML/CSS/JS (17,132 characters) with no build step
+The page is 21,441 bytes of inline HTML/CSS/JS (21,416 characters) with no build step
 and no asset server.
 
 | tab | what it is for |
 |---|---|
 | **Generator Mode** | build or rebuild the fixture — users, credentials, activity, sessions, servers — i.e. the accounts Operational Mode then spends |
-| **Operational Mode** | start/stop the mock API, run a load pass, **join a server** with a chosen set of accounts, and re-use a run's **account token file** |
-| **Settings** | every knob the other two tabs read, validated on save into `var/console.json` (mode 0600) |
+| **Operational Mode** | two options: **get accounts info** (`user:pass` or `user:token` for the accounts in your list) and **join servers** (N accounts from that list into a room of your fixture), plus the load run and the mock API's start/stop |
+| **Settings** | every knob the other two tabs read, the account list (edit, sync, rewrite, seed), validated on save into `var/console.json` (mode 0600) |
 
 Jobs run one at a time, deliberately: SQLite has one writer and `--fresh` truncates, so
 a second generator job would corrupt the fixture rather than race with the first. The tab
@@ -335,44 +372,79 @@ default 40 ms simulated latency.
 
 ### Operational Mode's two options
 
-**Server join.** Pick a server from your own fixture — the dropdown is `GET /servers`
-(id, name, live member count, capacity, private flag) — pick where the accounts come
-from (a token dump from a previous run, or the newest fixture logins) and how many, and
-each account is sent through the mock API's own `POST /servers/<id>/join`, one at a time.
-The result is the API's answer per account, not a hope:
+The tab is two numbered options, because that is the order people actually want them in:
+first you get the accounts out, then you spend them.
+
+**Option A — accounts info.** Writes one file out of the account list in two possible
+formats: `username:password` (the fixture's own shared password, from Settings) or
+`username:token` (a live session row of the mock API above). You choose the format, whether
+the selection is the whole fixture or just the accounts your list names, and a maximum line
+count; the buttons are *Write the file*, *Show it (masked)* and *Revoke those tokens*. Both files land
+next to the list at 0600 (`var/accounts-userpass.txt`, `var/accounts-tokens.txt`) and both are
+local-only:
 
 ```
-{"server_id": 1, "accounts": 25, "counts": {"joined": 25}, "p50_ms": 43.95, "max_ms": 47.97,
- "joined_user_ids": [298, 296, 294, ...]}
+liam.voss24:Fixture-Test-Pass-2026!        vdelgado2061:ses_90c801f97b7684319e1b429ad56
 ```
 
-Those are your app's rules, applied by your app: a repeat 3-account join into the same
-room returns `{"already-member": 3}` and adds no rows; a `private` row returns
-`{"refused": 3}` (the gate in this fixture is the row's own `slug`, `GET /servers` blanks
-that column on private rows so a listing cannot hand out the code, and there is no field
-anywhere that takes an invite code from outside); a `capacity=1` row given three accounts
-returns `{"joined": 1, "refused": 2}` and leaves exactly one live membership. Set
+The token half is the important limitation: it is a session on **this** fixture's API, minted
+from sessions with `revoked=0`, newest first. It is not a token for any platform you do not
+run, and a `user:token` file you point at someone else's API is simply not understood by it.
+*Show it* renders the file masked (`lara.cruz8:se…(32 chars hidden)`) with a `?reveal=1`
+opt-in, and *Revoke those tokens* runs `load.accounts --revoke <file> --delete`, which kills
+those sessions and removes the plaintext — measured `revoked 4 live session(s) from
+accounts-tokens.txt; 0 left active`. A `user:pass` file has no sessions to revoke, so the
+same button only removes it, and says so: `removed accounts-userpass.txt (no sessions to
+revoke: it held passwords)`.
+
+Below that table sit the dumps a load run left behind (`identity<TAB>token` per worker). They
+are the same kind of object and behave the same way. The two exports above are deliberately
+*not* in that list, and `/api/dump` and `/api/revoke` refuse them by name — the dumps table is
+a list of files whose tokens can be spent and revoked, so a password file must not be
+selectable there even though `accounts-userpass.txt` passes the filename rule.
+
+**Option B — server join.** Pick a server from your own fixture — the dropdown is
+`GET /servers` (id, name, live member count, capacity, private flag) — pick where the
+accounts come from (the account list, a token dump from a previous run, or the newest fixture
+logins), how many, and the pacing; then *Join* sends each account through the mock API's own
+`POST /servers/<id>/join`, one at a time. The result is the API's answer per account, not a
+hope:
+
+```
+{"server_id": 1, "accounts": 3, "counts": {"joined": 3}, "p50_ms": 43.99, "max_ms": 45.08,
+ "joined_user_ids": [3, 4, 5]}
+```
+
+Those are your app's rules, applied by your app: a repeat 3-account join into the same room
+returns `{"already-member": 3}` and adds no rows; a `private` row returns `{"refused": 3}`
+(the gate in this fixture is the row's own `slug`, `GET /servers` blanks that column on
+private rows so a listing cannot hand out the code, and there is no field anywhere that takes
+an invite code from outside); a `capacity=1` row given three accounts returns
+`{"joined": 1, "refused": 2}` and leaves exactly one live membership. Set
 `join_rate_limit_per_min` to 1 in Settings, restart the API so it re-reads config, and a
 6-account join reports `{"already-member": 1, "throttled": 5}` — throttling shows up as a
 count instead of quietly becoming a success.
 
-Undo is a button, not a scheduler. The join job returns the `user_id`s it created rows
-for, and *Leave* replays `POST /servers/<id>/leave` over exactly those ids (measured:
-`{"server_id": 1, "left": 25, "skipped": 0}`). `left_ts` is set and the row stays — a
-fixture whose joins vanish cannot be audited — and re-joining reopens the same row
-(`{"rejoined": 2}`) instead of appending one.
+When the accounts come from the list, a name the fixture does not recognise is dropped before
+anything is sent and reported, and an account that cannot log in (pending verification, or
+banned) is skipped rather than half-joined. That is why the list carries inactive accounts:
+see the account list below.
 
-**Account token file.** A load run writes `var/reports/accounts-<stamp>.txt` (one
-`identity<TAB>token` per worker) plus the `.md` twin. Operational Mode lists those dumps
-with their token counts; picking one is how you hand the same accounts to the next job,
-and *Revoke* runs `load.accounts --revoke` on it — measured, `revoked 10 live session(s)
-from accounts-20260911-062442.txt; 0 left active`, with `revoke.sql` written beside it at
-0600. A token file is only usable if its tokens resolve to live sessions *in this fixture*:
-a stale or foreign dump raises `every token in that file is revoked or unknown to this
-fixture; run a load job to mint a fresh dump` rather than being tried. The tab shows a
-masked copy of a dump (`/api/dump` masks every token unless you ask for `?reveal=1`) and
-refuses any name that is not `accounts-<something>.txt`, so it cannot be talked into
-reading a file outside the accounts directory.
+Undo is a button, not a scheduler. The join job returns the `user_id`s it created rows for,
+and *Leave* replays `POST /servers/<id>/leave` over exactly those ids (measured:
+`{"server_id": 1, "left": 3, "skipped": 0}`). `left_ts` is set and the row stays — a fixture
+whose joins vanish cannot be audited — and re-joining reopens the same row (`{"rejoined": 2}`)
+instead of appending one. The button walks back to the newest join that actually created
+memberships, so joining, retrying the same accounts (all `already-member`), and then clicking
+*Undo: those accounts leave* still removes the three that went in — it walks back to the
+newest join that created rows — and refuses with a named reason only when no join in the
+session created anything. Clicking it twice is an honest no-op (`{"left": 0, "skipped": 3}`),
+because those ids are already gone, not an error.
+
+There is no link field in Option B, on purpose. A URL there would point the tool at somebody
+else's room, and moving a crowd of accounts into a server you do not operate is the thing
+this repo declines to do; `--bootstrap`'s tab, the CLI and the settings file all enforce the
+same boundary (see below).
 
 ### Settings, and what the console refuses
 
@@ -395,6 +467,31 @@ connection, and saving a valid patch replaces the broken file with a note saying
 accounts the Operational tab logs in with cannot drift apart — the password is written into
 the seeder's own `--test-password`, and the settings file is 0600 because of it.
 
+The account list is its own card here, because it is the thing Option A and Option B both
+read: a plain text file (`var/accounts.txt` by default, path editable in Settings) of one
+username or email per line, with `#` comments. It is a *selection*, not a copy — it says
+which fixture accounts the Operational tab may use — and it is meant to be hand-edited:
+
+| button | what it does |
+|---|---|
+| Preview removal | the dry run of Sync: how many accounts the file does not list, how many stay |
+| Sync: delete what the file omits | deletes every fixture account the file does not list, and their credentials, sessions, events, flags and memberships |
+| Rewrite file from fixture | replaces the file with every account the fixture has, in id order |
+| Seed from newest accounts | first-run helper: adds the newest `bootstrap_accounts` accounts to whatever the file already holds |
+| View file | the file's contents in the browser (usernames only — the list holds no secrets) |
+
+Editing the file to two of nine accounts and pressing *Sync* is how you remove accounts; the
+preview first, because deleting the wrong set of accounts is the one irreversible thing in the
+tool. Measured, a Sync of five removed accounts reported
+`{"deleted": 5, "kept": 4, "children": {"credentials": 5, "sessions": 16, "events": 27,
+"flags": 0, "memberships": 0, "invite_edges": 0}}` with zero orphan rows and all three servers
+still present — rooms are handed to a surviving owner (`ON DELETE CASCADE` on `servers.owner_id`
+would otherwise delete the room with its founder). Two guards sit in front of that: a file
+whose lines match nothing is refused outright rather than read as "delete everything"
+(`the list matches no account in this fixture: refusing to delete all 30 of them`), and the
+list keeps inactive accounts on purpose, since anything the list omits is what the next Sync
+removes.
+
 Two things no tab, no field, and no command-line flag will do:
 
 * **address anything that is not `127.0.0.1`.** There is no base-URL, host, or invite-link
@@ -411,12 +508,23 @@ Two things no tab, no field, and no command-line flag will do:
   widens which hostname is trusted, not who may drive the console, and it prints a warning
   naming the port at startup.
 
-`python3 -m console --port 8010 --settings var/console.json --verbose` covers the flags;
-`--host` and `--allow-nonlocal` are the two that change the security posture, and the
-`db`, `api_port` and other knobs belong to the Settings tab, not to the command line. The
-suite behind all of this is `tests/test_console.py` (35 tests: the settings rules, the
-header guard, the file-name rules, and join/undo against a live fixture), and the routes
-themselves have 7 more in `tests/test_mockapi.py`; the repo is at 139.
+```
+python3 -m console --port 8010 --settings var/console.json --verbose
+python3 -m console --bootstrap --open-browser        # what run.bat does
+```
+
+`--host` and `--allow-nonlocal` are the two flags that change the security posture, and
+`--bootstrap` / `--open-browser` are the first-run pair the launcher passes: `--bootstrap`
+generates `bootstrap_accounts` accounts and seeds the list **only when the fixture database
+does not exist yet**, then does nothing on every later start. The `db`, `api_port` and other
+knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
+or base-URL flag to point at somebody else's system.
+
+The suite behind all of this is `tests/test_console.py` (50 tests: the settings rules, the
+header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
+`tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
+and may not delete, the export shape and its permissions); the routes have 26 in
+`tests/test_mockapi.py`, and the repo is at 189 under `make test`.
 
 ## Limits, honestly
 
@@ -447,3 +555,14 @@ rejected unless its `Host`, `Origin` and `Sec-Fetch-Site` say it came from the p
 — so a remote site cannot drive a console that truncates your fixture. Its `db` field goes
 through the same scratch-directory rule as the seeder's `--db`, dumps and `revoke.sql` are
 written 0600, and `var/console.json` too because it holds `test_password`.
+
+Two more, added when the account list became the thing both Operational options read:
+
+* the list and its two exports are **not run dumps**. They live in the same scratch directory
+  and match `accounts-*.txt`, so the dumps table, `/api/dump` and `/api/revoke` each refuse
+  those three names by path (`refused: accounts-userpass.txt is the account list or one of its
+  exports, not a run dump`). A password file must never be selectable as a token source, and
+  `--revoke` on it would report a successful no-op.
+* `Sync` refuses a list that matches **nothing** in the fixture rather than reading it as
+  "delete everything" — an emptied or typo'd file is an accident, and rebuilding is what
+  `--fresh` is for. The dry run never refuses anything: a preview has no side effects to protect.

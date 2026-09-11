@@ -124,6 +124,44 @@ class ConsistencyTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, f"{mod} --help failed: {proc.stderr[-400:]}")
             self.assertIn("usage:", proc.stdout.lower(), f"{mod} has no usage line")
 
+    def test_the_windows_launchers_say_things_that_work(self) -> None:
+        """A `.bat` file is only ever executed by someone double-clicking it on Windows, so
+        this box cannot run it — which is exactly why its contents get checked against the
+        tools it calls instead of against a shell. A typo'd flag in here is noticed by the
+        first person who tries the tool, not by whoever changed it."""
+        help_text = subprocess.run([sys.executable, "-m", "console", "--help"], cwd=ROOT,
+                                   capture_output=True, text=True).stdout
+        run = (ROOT / "run.bat").read_text(encoding="utf-8", errors="replace")
+        line = next((ln for ln in run.splitlines() if "-m console" in ln), "")
+        self.assertTrue(line, "run.bat stopped launching the console")
+        flags = set(re.findall(r"--[a-z][a-z0-9-]+", line))
+        self.assertEqual({"--bootstrap", "--open-browser"}, flags,
+                         f"the launcher is supposed to pass the first-run pair, saw {flags}")
+        self.assertEqual(sorted(f for f in flags if f not in help_text), [],
+                         f"run.bat passes a flag console refuses: {line!r}")
+        raw = (ROOT / "run.bat").read_bytes() + (ROOT / "build_exe.bat").read_bytes()
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""),
+                         "batch files need CRLF endings or goto/labels misbehave on Windows")
+
+        build = (ROOT / "build_exe.bat").read_text(encoding="utf-8", errors="replace")
+        self.assertIn("console\\__main__.py", build, "the .exe has to start where -m console starts")
+        self.assertTrue((ROOT / "console" / "__main__.py").exists())
+        data = re.search(r'--add-data "([^"]+)"', build)
+        self.assertIsNotNone(data, "the seeder reads schema.sql next to its own module, so the "
+                                   "bundle must carry it or the .exe fails on its first Generate")
+        source = data.group(1).split(";")[0].replace("\\", "/")
+        self.assertTrue((ROOT / source).is_file(), f"build_exe.bat bundles a path not in the repo: {source}")
+        for pkg in re.findall(r"--collect-submodules\s+([a-z_]+)", build):
+            self.assertTrue((ROOT / pkg / "__init__.py").is_file(),
+                            f"--collect-submodules {pkg}: no such package to collect")
+        # A bundled .exe has no interpreter to hand a child process, so every module the
+        # console runs has to be called in-process. `subprocess` anywhere in the runtime
+        # packages would turn build_exe.bat into an .exe that works until you press a button.
+        spawners = [str(path.relative_to(ROOT)) for pkg in ("console", "load", "seeds", "mockapi", "abuse")
+                    for path in sorted(ROOT.joinpath(pkg).glob("*.py"))
+                    if "import subprocess" in path.read_text() or "sys.executable" in path.read_text()]
+        self.assertEqual(spawners, [], f"{spawners} would break the frozen build")
+
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real
         option on one of the entry points in CLI_MODULES."""

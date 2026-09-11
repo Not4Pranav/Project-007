@@ -178,6 +178,31 @@ def write_artifacts(out_base: Path, rows: list[AccountRow], *, meta: dict) -> li
     return paths
 
 
+def split_pair(line: str) -> tuple[str, str] | None:
+    """One line of an account list to (identity, token), or None when it is not one.
+
+    Three shapes are accepted, because the same file is read by a load run and by
+    `--revoke`: `identity<TAB>token` (what `load.engine` writes), `identity:token` (what
+    the console's accounts-info export writes, and the shape people already keep local
+    credentials in), and a bare token. The right-hand side has to look like a token, which
+    is what keeps a stray word — or a whole `user:pass` file — from becoming a revocation
+    a stray word still cannot become a revocation target. A `user:pass` line therefore
+    yields nothing: `--revoke` reports 0 live sessions rather than guessing.
+    """
+    text = line.strip()
+    if not text or text.startswith("#"):
+        return None
+    if m := TOKEN_LINE.match(text):  # what load.engine writes: no shape gate on the token
+        return m.group("ident"), m.group("token")
+    if ":" in text:
+        head, _, tail = text.rpartition(":")
+        head, tail = head.strip(), tail.strip()
+        if head and tail and _BARE_TOKEN.fullmatch(tail):
+            return head, tail
+        return None
+    return ("", text) if _BARE_TOKEN.fullmatch(text) else None
+
+
 def read_tokens(path: Path) -> list[str]:
     """Parses the emitted .txt (comments and blank lines ignored).
 
@@ -187,13 +212,9 @@ def read_tokens(path: Path) -> list[str]:
     """
     tokens: list[str] = []
     for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if m := TOKEN_LINE.match(line):
-            tokens.append(m.group("token"))
-        elif _BARE_TOKEN.fullmatch(line):
-            tokens.append(line)
+        pair = split_pair(line)
+        if pair:
+            tokens.append(pair[1])
     return tokens
 
 
@@ -202,17 +223,15 @@ def parse_file(path: str | Path) -> list[tuple[str, str]]:
     (identity, token) pairs the engine can hand to workers.
 
     Identities are kept so the account dump can label a row as pre-minted instead of
-    captured, and so a `--token-file` run is still traceable to an account.
+    captured, and so a `--token-file` run is still traceable to an account. `identity:token`
+    is accepted alongside `identity<TAB>token`, which is what lets the console's own
+    `user:token` export be fed straight back in.
     """
     pairs: list[tuple[str, str]] = []
     for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if m := TOKEN_LINE.match(line):
-            pairs.append((m.group("ident"), m.group("token")))
-        elif _BARE_TOKEN.fullmatch(line):
-            pairs.append(("", line))
+        pair = split_pair(line)
+        if pair:
+            pairs.append(pair)
     return pairs
 
 

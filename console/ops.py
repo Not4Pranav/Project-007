@@ -32,6 +32,7 @@ from load.accounts import parse_file
 from load.engine import main as load_main
 from mockapi.client import ApiClient
 from mockapi.server import Config, build_server
+from seeds import roster as roster_mod
 from seeds.export import main as export_main
 from seeds.seed import main as seed_main
 
@@ -167,10 +168,71 @@ def fixture_status(settings: Settings) -> dict:
             out["servers"] = []
     finally:
         conn.close()
+    out["roster"] = roster_status(settings, conn=None)
     dumps_dir = Path(settings.accounts_dir)
     dumps = sorted(dumps_dir.glob("accounts-*.txt"), key=lambda p: p.stat().st_mtime, reverse=True) \
         if dumps_dir.exists() else []
-    out["dumps"] = [{"path": str(p), "name": p.name, "tokens": _count_dump(p)} for p in dumps[:10]]
+    protected = protected_names(settings)
+    out["dumps"] = [{"path": str(p), "name": p.name, "tokens": _count_dump(p)}
+                    for p in dumps[:10] if p.name not in protected]
+    return out
+
+
+def protected_names(settings: Settings) -> set[str]:
+    """Names that live in `accounts_dir` but are not run dumps: the account list itself and
+    its two plaintext exports.
+
+    They sit in the same scratch directory (`var/`) and they match `accounts-*.txt`, so the
+    dumps table, the dump reader and the revoke action would all happily offer a
+    `user:pass` file. That is wrong twice over: the table is a list of token dumps, and
+    `--revoke` on a password file is a no-op that looks like a success. Refuse them by name
+    in each of those three places rather than trusting the UI to hide them.
+    """
+    try:
+        return {Path(settings.account_list).name,
+                *[roster_export_path(settings, kind).name for kind in ("userpass", "token")]}
+    except (OSError, ValueError):  # settings we cannot read are not a licence to serve secrets
+        return set()
+
+
+def roster_status(settings: Settings, *, conn: sqlite3.Connection | None) -> dict:
+    """The account list the operator edits, compared against the fixture.
+
+    The file is a *selection*, not a copy: it says which fixture accounts the Operational
+    tab may use. So the honest status is "file lists N, fixture has M, K are not listed" —
+    and the unlisted ones are what a Sync would delete, which is why the number is on the
+    page before any button is clicked.
+    """
+    path = Path(settings.account_list)
+    own = conn is None
+    handle = conn or sqlite3.connect(f"file:{Path(settings.db).resolve()}?mode=ro", uri=True, timeout=5)
+    try:
+        in_fixture = roster_mod.fixture_identities(handle)
+    except sqlite3.Error:
+        in_fixture = []
+    finally:
+        if own:
+            handle.close()
+    out: dict = {"path": str(path), "exists": path.exists(), "listed": 0, "in_fixture": len(in_fixture),
+                 "unlisted": [], "unknown": [], "duplicates": []}
+    if not path.exists():
+        out["unlisted"] = in_fixture[:20]
+        return out
+    try:
+        read = roster_mod.read_roster(path)
+    except OSError as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    out["listed"] = len(read.identities)
+    out["duplicates"] = read.duplicates[:10]
+    listed = {i.lower() for i in read.identities}
+    in_fixture_lower = {i.lower() for i in in_fixture}
+    # names in the file that are not in the fixture (typos, or synced away) and the other
+    # way round (accounts the file does not list yet) — the two directions of drift, apart
+    out["unknown"] = [i for i in read.identities if i.lower() not in in_fixture_lower][:20]
+    drift = [i for i in in_fixture if i.lower() not in listed]
+    out["unlisted_count"] = len(drift)
+    out["unlisted"] = drift[:20]
     return out
 
 
@@ -263,12 +325,200 @@ def job_generate(settings: Settings) -> Callable[[Job], dict]:
     def run(job: Job) -> dict:
         argv = settings.base_argv()
         job.say(f"python3 -m seeds.seed {' '.join(argv)}")
+        before = 0
+        if Path(settings.db).exists():
+            probe = sqlite3.connect(settings.db)
+            try:
+                before = int(probe.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0])
+            finally:
+                probe.close()
         code = seed_main(argv)
         if code:
             job.say(f"seeder exited {code}")
+        roster_info: dict = {}
+        if not code:
+            roster_info = _sync_roster_after_generate(settings, job, after_id=before)
         status = fixture_status(settings)
+        # merged into the return value, not job.result: the Runner assigns the result after
+        # the job returns, so anything written to job.result mid-flight would be dropped
         return {"__code__": code, "tables": status["tables"], "fixture_hash": status["fixture_hash"],
-                "servers": len(status["servers"]), "seed_params": status["seed_params"]}
+                "servers": len(status["servers"]), "seed_params": status["seed_params"], **roster_info}
+    return run
+
+
+def _sync_roster_after_generate(settings: Settings, job: Job, *, after_id: int) -> dict:
+    """Add exactly the accounts this run created to the roster file.
+
+    Two modes, because a generate click means two different things. In append mode only ids
+    greater than `after_id` are new, so a batch somebody deleted from the file but has not
+    synced yet is not resurrected by an unrelated click. In replace mode the seeder truncated
+    the table and re-numbered it, which invalidates every name the file held — so the file is
+    rewritten from the fixture instead of appended to, and cannot be left pointing at accounts
+    that no longer exist (which would show up as `unknown` here and as a refused join later).
+
+    Inactive accounts are included on purpose: the list mirrors the fixture, and Sync deletes
+    what the list omits (see `seeds.roster.fixture_identities`).
+    """
+    path = Path(settings.account_list)
+    rebuild = settings.write_mode == "replace"
+    conn = sqlite3.connect(settings.db)
+    try:
+        if rebuild:
+            new_names = roster_mod.fixture_identities(conn)
+        else:
+            new_names = [r[0] for r in conn.execute(
+                "SELECT username FROM users WHERE id > ? ORDER BY id", (after_id,))]
+        current: list[str] = []
+        if path.exists() and not rebuild:
+            with contextlib.suppress(OSError):
+                current = roster_mod.read_roster(path).identities
+    finally:
+        conn.close()
+    merged = list(dict.fromkeys([*current, *new_names]))
+    written = roster_mod.write_roster(path, merged)
+    job.say(f"roster {path.name}: "
+            + (f"rewritten from the rebuilt fixture, {written} listed" if rebuild
+               else f"{len(new_names)} new, {written} listed in total"))
+    return {"roster": str(path), "roster_added": len(new_names), "roster_total": written}
+
+
+def job_roster(settings: Settings, action: str) -> Callable[[Job], dict]:
+    """preview | sync | rewrite | seed — the account list, and the only destructive pair.
+
+    `sync` deletes fixture accounts the file does not list. It is offered as a preview
+    first for that reason: a hand-edited text file should not be able to wipe a fixture
+    through a mis-click.
+    """
+    def run(job: Job) -> dict:
+        path = Path(settings.account_list)
+        if action == "rewrite":
+            conn = sqlite3.connect(settings.db)
+            try:
+                names = roster_mod.fixture_identities(conn)
+            finally:
+                conn.close()
+            written = roster_mod.write_roster(path, names)
+            job.say(f"roster rewritten from the fixture: {written} accounts")
+            return {"written": written, "path": str(path)}
+        if action == "seed":
+            # first-run setup: hand the newest N fixture accounts to the file, so the tool
+            # opens with a usable list instead of an empty one
+            conn = sqlite3.connect(settings.db)
+            try:
+                # newest N whatever their status: the list mirrors the fixture (see
+                # fixture_identities), and an account that cannot log in is refused at join
+                # time instead of being quietly left out of the file
+                names = [r[0] for r in conn.execute(
+                    "SELECT username FROM users ORDER BY id DESC LIMIT ?",
+                    (max(1, settings.bootstrap_accounts),))]
+            finally:
+                conn.close()
+            existing = roster_mod.read_roster(path).identities if path.exists() else []
+            merged = list(dict.fromkeys([*names, *existing]))
+            written = roster_mod.write_roster(path, merged)
+            job.say(f"roster seeded with {len(names)} account(s): {written} listed")
+            return {"written": written, "path": str(path), "seeded": len(names)}
+        if not path.exists():
+            raise RuntimeError(f"{path} does not exist — use Rewrite from fixture to create it")
+        listed = roster_mod.read_roster(path).identities
+        conn = sqlite3.connect(settings.db)
+        try:
+            result = roster_mod.sync(conn, listed, apply=(action == "sync"))
+            conn.commit()
+        finally:
+            conn.close()
+        if action == "sync":
+            job.say(f"removed {result.get('deleted', 0)} account(s); "
+                    f"kept {result['kept']}  children={json.dumps(result.get('children', {}))}")
+        else:
+            job.say(f"preview: {result['would_delete']} account(s) would be removed, "
+                    f"{result['kept']} kept")
+        result["action"] = action
+        return result
+
+    return run
+
+
+def job_accounts_info(settings: Settings, kind: str, limit: int, use_roster: bool) -> Callable[[Job], dict]:
+    """Write `user:pass` or `user:token` for the roster (or for the whole fixture).
+
+    Both kinds are plaintext on purpose — that is what was asked for — so the file lands
+    next to the roster at 0600, the job reports its path, and *Revoke*/**delete** stay one
+    click away in Settings. `user:pass` is the fixture's shared password; `user:token` is
+    a live session of the local mock API. Neither is a credential for any other service.
+    """
+    def run(job: Job) -> dict:
+        path = Path(settings.account_list)
+        listed = roster_mod.read_roster(path).identities if (use_roster and path.exists()) else None
+        if use_roster and not listed:
+            raise RuntimeError(f"{path} lists no accounts to export — Generate adds them, "
+                               f"or Settings > Seed the list from the newest fixture accounts")
+        conn = sqlite3.connect(settings.db)
+        try:
+            rows = roster_mod.rows_for_export(conn, listed, password=settings.test_password, limit=limit)
+        finally:
+            conn.close()
+        if not rows:
+            raise RuntimeError("nothing to export: no active fixture accounts in that selection")
+        stem = Path(settings.account_list).with_suffix("")
+        out = Path(str(stem) + ("-tokens.txt" if kind == "token" else "-userpass.txt"))
+        report = roster_mod.write_export(out, kind, rows)
+        if listed is not None and len(listed) > len(rows):
+            # rows_for_export only hands back accounts that can authenticate, so a file
+            # shorter than the roster is expected — say so instead of letting the difference
+            # read as a bug
+            report["skipped_inactive"] = len(listed) - len(rows)
+            job.say(f"{report['skipped_inactive']} listed account(s) are not active (pending "
+                    f"verification or banned), so there is no credential to write for them")
+        job.say(f"{kind}: {report['written']} line(s) -> {report['path']}"
+                + (f"  ({report['skipped_no_session']} skipped: no live session)"
+                   if report["skipped_no_session"] else ""))
+        if kind == "token" and report["skipped_no_session"]:
+            job.say("accounts with no live session: start the API and run a load pass, "
+                    "or use the user:pass export")
+        report["selection"] = "roster" if listed else "whole fixture"
+        return report
+
+    return run
+
+
+def roster_export_path(settings: Settings, which: str) -> Path:
+    """Where an accounts-info export lands: next to the roster, with a name that says what it is."""
+    stem = Path(settings.account_list).with_suffix("")
+    return Path(str(stem) + ("-tokens.txt" if which == "token" else "-userpass.txt"))
+
+
+def job_roster_revoke(settings: Settings, which: str) -> Callable[[Job], dict]:
+    """Clean up an accounts-info export: revoke the sessions, then remove the plaintext.
+
+    Tokens go first — an unreadable file is worthless, a readable file with live tokens is
+    the risk. A `user:pass` export has nothing to revoke (the fixture's password is shared
+    and not rotatable here), so removing the file *is* the whole action, and the account
+    itself stays in the fixture until the roster says otherwise.
+    """
+    def run(job: Job) -> dict:
+        path = roster_export_path(settings, which)
+        if not path.exists():
+            raise RuntimeError(f"{path} was never written — use Option A's Write the file first")
+        report: dict = {"path": str(path)}
+        if which == "token":
+            import contextlib
+            import io
+
+            from load.accounts import main as accounts_main
+
+            args = ["--revoke", str(path), "--db", settings.db, "--delete"]
+            with contextlib.redirect_stdout(io.StringIO()) as cap, contextlib.redirect_stderr(io.StringIO()):
+                code = accounts_main(args)
+            report["output"] = cap.getvalue().strip() or f"exit {code}"
+            report["code"] = code
+            job.say(report["output"])
+        else:
+            path.unlink()
+            report["output"] = f"removed {path.name} (no sessions to revoke: it held passwords)"
+            job.say(report["output"])
+        return report
+
     return run
 
 
@@ -353,6 +603,35 @@ def usable_accounts(settings: Settings, source: str, token_file: str, limit: int
             raise RuntimeError("every token in that file is revoked or unknown to this fixture; "
                                "run a load job to mint a fresh dump")
         return out
+    if source == "roster":
+        path = Path(settings.account_list)
+        if not path.exists():
+            raise RuntimeError(f"{path} does not exist — Generator Mode writes it, or use "
+                               f"Settings > Seed the list from the newest fixture accounts")
+        names = roster_mod.read_roster(path).identities[:limit]
+        if not names:
+            raise RuntimeError(f"{path} is empty: nothing to drive")
+        conn = sqlite3.connect(f"file:{Path(settings.db).resolve()}?mode=ro", uri=True, timeout=5)
+        try:
+            idents = roster_mod.resolve(conn, names)
+        finally:
+            conn.close()
+        out = []
+        client = ApiClient(settings.api_url(), timeout=10.0)
+        try:
+            for identity in idents:  # names the fixture does not know were already dropped
+                resp = client.login(identity, settings.test_password)
+                if resp.status != 200 or not isinstance(resp.data, dict) or "token" not in resp.data:
+                    continue  # unknown name, or a login the fixture's rules refused
+                out.append((int(resp.data["user_id"]), resp.data["token"]))
+                if len(out) >= limit:
+                    break
+        finally:
+            client.close()
+        if not out:
+            raise RuntimeError(f"none of the {len(names)} name(s) in {path.name} could log in — "
+                               f"check Settings > test_password matches this fixture")
+        return out
     if source == "fixture-logins":
         conn = sqlite3.connect(f"file:{Path(settings.db).resolve()}?mode=ro", uri=True, timeout=5)
         try:
@@ -422,7 +701,7 @@ def job_join(settings: Settings, server_id: int, source: str, token_file: str, l
     return run
 
 
-def job_leave(settings: Settings, server_id: int, user_ids: list[int]) -> Callable[[Job], dict]:
+def job_leave(settings: Settings, server_id: int, user_ids: list[int], *, note: str = "") -> Callable[[Job], dict]:
     """Undo a join: the accounts just listed leave again, through the API's own route.
 
     Deliberately an explicit action over an explicit id list (the ids a join job
@@ -430,6 +709,8 @@ def job_leave(settings: Settings, server_id: int, user_ids: list[int]) -> Callab
     does not run membership timing on a timer.
     """
     def run(job: Job) -> dict:
+        if note:
+            job.say(note)
         if not API.running:
             raise RuntimeError("the mock API is not running — start it from the same tab")
         if not user_ids:

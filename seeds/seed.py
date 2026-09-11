@@ -9,6 +9,7 @@ Only ever point this at a database you own (local, ephemeral CI, or staging).
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 import time
@@ -54,8 +55,15 @@ def build_user_rows(
     password: str,
     iterations: int,
     algo: str = "pbkdf2_sha256",
+    id_offset: int = 0,
+    taken_usernames: set[str] | None = None,
+    taken_emails: set[str] | None = None,
 ) -> tuple[list[dict], list[Burst]]:
-    """Generate user dicts in chronological order (ids follow signup order)."""
+    """Generate user dicts in chronological order (ids follow signup order).
+
+    `id_offset` and the `taken_*` sets are what make `--append` possible: a second batch
+    continues the key space instead of colliding with the accounts already in the file.
+    """
     lo, hi = window
     bots = max(0, min(bots, n_users))  # --users is the total *including* injected bots
     curve = SignupCurve(lo, days, tuple((r[3], r[5]) for r in corpus.REGIONS), growth=growth)
@@ -80,8 +88,8 @@ def build_user_rows(
 
     timestamps = sorted(organic + burst_times[: len(burst_times)])
 
-    taken_users: set[str] = set()
-    taken_emails: set[str] = set()
+    taken_users: set[str] = set(taken_usernames or ())
+    taken_emails: set[str] = set(taken_emails or ())
     # A few shared /24s model NAT/mobile-carrier exit nodes: real, and the
     # reason naive "1 signup per IP" rate limiting is a false-positive machine.
     ip_pool = [(rng.int(24, 223), rng.int(0, 255), rng.int(0, 255)) for _ in range(14)]
@@ -89,7 +97,7 @@ def build_user_rows(
     cohorts = list(DEFAULT_COHORTS)
 
     rows: list[dict] = []
-    i = count(1)
+    i = count(id_offset + 1)
     for idx, ts in enumerate(timestamps):
         cohort = cohorts[rng.weighted_index(cohort_weights)[0]]
         row, _ = build_profile(
@@ -256,9 +264,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="shared servers/join targets to create (0 disables)")
     p.add_argument("--no-activity", action="store_true")
     p.add_argument("--fresh", action="store_true", help="wipe rows first (schema stays)")
+    p.add_argument("--append", action="store_true",
+                   help="add --users NEW accounts to what is already in the db (ids continue, "
+                        "signups land in the last 24h, existing rows untouched) instead of "
+                        "refusing a non-empty database")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
 
+    if a.append and a.fresh:
+        print("--append and --fresh contradict each other: pick one", file=sys.stderr)
+        return 3
     if "prod" in a.db and not a.quiet:
         print("refusing to look like a production target; pass an explicit fixture path", file=sys.stderr)
         return 3
@@ -273,22 +288,43 @@ def main(argv: list[str] | None = None) -> int:
     if a.fresh:
         reset(conn)
     existing = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    if existing and not a.fresh:
-        print(f"{a.db} already has {existing} users; use --fresh to rebuild", file=sys.stderr)
+    if existing and not (a.fresh or a.append):
+        print(f"{a.db} already has {existing} users; use --fresh to rebuild or --append to add",
+              file=sys.stderr)
         return 3
+
+    id_offset = 0
+    taken_users: set[str] = set()
+    taken_emails: set[str] = set()
+    if a.append:
+        # Appended accounts *are* new signups, so they land in the last day rather than
+        # being scattered through the history the existing rows already occupy.
+        id_offset = int(conn.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0])
+        taken_users = {r[0] for r in conn.execute("SELECT username FROM users")}
+        taken_emails = {r[0] for r in conn.execute("SELECT email FROM users")}
+        end = _parse_when("now")
+        a.days = min(a.days, 1) or 1
+        start = end - a.days * 86400
 
     t0 = time.perf_counter()
     rows, bursts = build_user_rows(
         rng, n_users=a.users, window=(start, end), days=a.days, growth=a.growth,
         burst_count=a.burst_count, burst_share=a.burst_share, bots=a.inject_bots,
         policy=policy, password=a.test_password, iterations=a.pbkdf2_iterations, algo=a.hash_algo,
+        id_offset=id_offset, taken_usernames=taken_users, taken_emails=taken_emails,
     )
     t_gen = time.perf_counter() - t0
 
     if rows:
         insert_rows(conn, rows)
 
-    servers = build_server_rows(rng, rows, max(0, a.servers))
+    have_servers = int(conn.execute("SELECT COUNT(*) FROM servers").fetchone()[0])
+    if a.append and have_servers:
+        servers = []  # ids would collide, and a second batch of accounts does not need new rooms
+        if not a.quiet:
+            print(f"--append: keeping the {have_servers} existing servers (--servers ignored)")
+    else:
+        servers = build_server_rows(rng, rows, max(0, a.servers))
     insert_servers(conn, servers)
 
     n_events = 0
@@ -304,12 +340,31 @@ def main(argv: list[str] | None = None) -> int:
     else:
         n_sessions = 0
 
+    total_users = int(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+    flagged = int(conn.execute("SELECT COUNT(*) FROM users WHERE is_synthetic_abuse=1").fetchone()[0])
+    prior: dict = {}
+    if a.append:  # the fixture's shape is the sum of its batches, so read what came first
+        raw = conn.execute("SELECT value FROM meta WHERE key='seed_params'").fetchone()
+        if raw:
+            with contextlib.suppress(json.JSONDecodeError):
+                prior = json.loads(raw[0])
     params = {
-        "users": a.users, "days": a.days, "seed": a.seed, "start": start, "end": end,
-        "growth": a.growth, "inject_bots": a.inject_bots, "bursts": len(bursts),
-        "events_multiplier": a.events, "pbkdf2_iterations": a.pbkdf2_iterations, "hash_algo": a.hash_algo,
-        "shared_password": bool(a.test_password),
+        "users": total_users, "days": a.days, "seed": a.seed, "start": start, "end": end,
+        "growth": a.growth, "inject_bots": flagged, "bursts": len(bursts),
+        "events_multiplier": a.events, "pbkdf2_iterations": a.pbkdf2_iterations,
+        "hash_algo": a.hash_algo, "shared_password": bool(a.test_password),
+        "appended": bool(a.append), "last_batch": a.users, "batches": 1,
     }
+    if a.append and prior:
+        # Kept from the first run because those knobs describe the whole fixture, not the
+        # last batch; `inject_bots` above is already the honest count of flagged rows.
+        params.update({
+            "days": prior.get("days", a.days),
+            "growth": prior.get("growth", a.growth),
+            "events_multiplier": prior.get("events_multiplier", a.events),
+            "bursts": int(prior.get("bursts", 0)) + len(bursts),
+            "batches": int(prior.get("batches", 1)) + 1,
+        })
     set_meta(conn, "seed_params", json.dumps(params, sort_keys=True))
     set_meta(conn, "fixture_hash", _digest(conn))
 

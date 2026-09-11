@@ -42,7 +42,12 @@ class Settings:
     min_password_length: int = 10
     register_domain: str = "loadtest.invalid"
     test_password: str = "Fixture-Test-Pass-2026!"
-    fresh: bool = True
+    # "append" keeps the accounts already in the file and adds to them; "replace" truncates.
+    # One knob, not a `fresh` bool next to it, so the two can never disagree.
+    write_mode: str = "append"
+    # --- the account list the operator edits by hand
+    account_list: str = "var/accounts.txt"
+    bootstrap_accounts: int = 5
     # --- targets
     api_port: int = 8000
     console_port: int = 8010
@@ -67,6 +72,7 @@ class Settings:
         "min_password_length": (6, 64), "api_port": (1024, 65535), "console_port": (1024, 65535),
         "rate_limit_per_min": (0, 100_000), "login_rate_limit_per_min": (0, 100_000),
         "join_rate_limit_per_min": (0, 100_000), "max_inflight": (1, 4096),
+        "bootstrap_accounts": (0, 100_000),
         "pbkdf2_iterations": (1, 1_000_000), "seed": (0, 2_147_483_647),
     }
     FLOAT_RANGE: ClassVar[dict[str, tuple[float, float]]] = {
@@ -80,6 +86,12 @@ class Settings:
         out = asdict(self)
         out.pop("unknown", None)
         return out
+
+    @property
+    def fresh(self) -> bool:
+        """Read-only view of "this run truncates", kept because `--fresh` is the seeder's
+        word for it. There is no writable `fresh` setting: `write_mode` is the knob."""
+        return self.write_mode == "replace"
 
     def api_url(self) -> str:
         # Fixed to loopback on purpose: the console hands this to the load engine as
@@ -96,8 +108,7 @@ class Settings:
                 # The generator seeds this password and the Operational tab logs in with it, so
                 # the two cannot drift apart. Fixture-only secret; never leaves 127.0.0.1.
                 "--test-password", self.test_password]
-        if self.fresh:
-            argv.append("--fresh")
+        argv.append("--append" if self.write_mode == "append" else "--fresh")
         return argv
 
     def server_config_kwargs(self) -> dict:
@@ -138,6 +149,23 @@ def _coerce_float(name: str, value: object, lo: float, hi: float) -> float:
     return f
 
 
+def safe_text_path(raw: object, *, field_name: str = "account_list") -> str:
+    """Same scratch-directory rule as the database, for the roster and its exports: a
+    hand-editable text file still should not be aimed at somebody's real config."""
+    text = str(raw or "").strip()
+    if not text:
+        raise SettingsError(f"{field_name} must be a path, not empty")
+    path = Path(text).expanduser()
+    parts = {q.lower() for q in path.resolve().parts}
+    if not {"var", "tmp", "tmpdirs"} & parts:
+        raise SettingsError(f"{field_name} must live under a var/ or tmp directory, got {text}")
+    if path.suffix not in (".txt", ".md", ".list"):
+        raise SettingsError(f"{field_name} must be a .txt/.md list file, got {text}")
+    if re.search(r"prod|live|production", path.name, re.I):
+        raise SettingsError(f"{field_name} looks like a real credential file ({path.name}); refusing")
+    return path.as_posix()
+
+
 def safe_fixture_path(raw: object, *, field_name: str = "db") -> str:
     """Only a path under a scratch directory, and never something that smells like a
     real database. `seeds.seed` has the same rule for its --db; the console repeats it
@@ -174,6 +202,15 @@ def validate(name: str, value: object) -> object:
         return text
     if name in ("db", "accounts_dir"):
         return safe_fixture_path(value, field_name=name) if name == "db" else str(value)
+    if name == "write_mode":
+        text = str(value).strip().lower()
+        if text not in ("append", "replace"):
+            raise SettingsError("write_mode is 'append' (add to the accounts that already exist) "
+                                "or 'replace' (truncate and rebuild) — got "
+                                f"{value!r}")
+        return text
+    if name == "account_list":
+        return safe_text_path(value)
     if name == "test_password":
         text = str(value)
         if not text.strip():
@@ -260,6 +297,11 @@ def load(path: Path) -> Settings:
         raise SettingsError(f"{path} is unreadable ({exc.__class__.__name__}); fix or delete it") from None
     if not isinstance(raw, dict):
         raise SettingsError(f"{path} must contain a JSON object")
+    if "fresh" in raw:
+        # An older settings file wrote a `fresh` bool. Honour it as the mode it meant
+        # rather than quietly flipping an operator from "replace" to "append".
+        wanted = "replace" if str(raw.pop("fresh")).strip().lower() in ("1", "true", "yes", "on") else "append"
+        raw.setdefault("write_mode", wanted)
     data: dict = {}
     for key, value in raw.items():
         if key not in {f.name for f in fields(Settings)} - {"unknown"}:

@@ -56,6 +56,47 @@ class CollectTest(unittest.TestCase):
         self.assertEqual(workers, 2)
 
 
+class SplitPairTest(unittest.TestCase):
+    """One parser for every account-list shape, because `--revoke` and a `--token-file` run
+    read the same files and must not disagree about what a token is."""
+
+    def pairs(self, blob: str) -> list[tuple[str, str]]:
+        from load.accounts import parse_file, split_pair
+
+        lines = [ln for ln in blob.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        parsed = parse_file(_tmp_write(blob))
+        self.assertEqual(parsed, [p for p in (split_pair(ln) for ln in lines) if p],
+                         "parse_file must be exactly split_pair over the accepted lines, "
+                         "so the two readers of a dump cannot disagree")
+        return parsed
+
+    def test_three_accepted_shapes(self) -> None:
+        got = self.pairs("bob\tses_tabtoken_1234567890\n"
+                         "bob:ses_colontoken_1234567890\n"
+                         "ses_bare_token_1234567890ab\n")
+        self.assertEqual(got, [("bob", "ses_tabtoken_1234567890"), ("bob", "ses_colontoken_1234567890"),
+                               ("", "ses_bare_token_1234567890ab")])
+
+    def test_short_tab_tokens_still_count(self) -> None:
+        """The tab form is what load.engine writes, so its old (looser) rule stays: no
+        length gate on a line that is explicitly `identity<TAB>token`."""
+        self.assertEqual(self.pairs("bob\tses_9\n"), [("bob", "ses_9")])
+
+    def test_a_password_file_is_not_a_token_file(self) -> None:
+        blob = "bob:Fixture-Test-Pass-2026!\nalice:ShortPw\njust some prose\n# comment\n"
+        self.assertEqual(self.pairs(blob), [])
+        from load.accounts import read_tokens
+
+        self.assertEqual(read_tokens(_tmp_write(blob)), [],
+                         "revoking a user:pass list must find nothing rather than guess")
+
+    def test_email_identity_with_a_colon_inside_it(self) -> None:
+        # rpartition on ':' keeps the longest token candidate, so an ident with a colon
+        # still resolves; the shape gate does the rest
+        self.assertEqual(self.pairs("a@b.invalid:ses_0123456789abcdef"),
+                         [("a@b.invalid", "ses_0123456789abcdef")])
+
+
 class RenderTest(unittest.TestCase):
     def test_txt_roundtrips_and_carries_no_password(self) -> None:
         text = render_txt(ROWS, base_url="http://127.0.0.1:8000", revoke_cmd="python3 -m load.accounts")
