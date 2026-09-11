@@ -25,7 +25,12 @@ DIURNAL: tuple[float, ...] = (
 
 @dataclass(frozen=True)
 class Cohort:
-    """A slice of the population that shares acquisition characteristics."""
+    """A slice of the population that shares acquisition characteristics.
+
+    `username_styles` is where the naming mix lives (see `make_username` for the
+    shapes); weighting it per cohort is what makes `--users 30000` look like
+    several acquisition channels instead of one generator.
+    """
 
     name: str
     weight: float

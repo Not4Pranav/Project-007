@@ -86,7 +86,9 @@ def generate_sessions(users: list[dict], rng: Rng, *, max_per_user: int = 6,
             out.append({
                 "user_id": u["id"],
                 "token": f"ses_{rng.hex_id(14)}",
-                "ip": u["signup_ip"] if rng.chance(0.7) else f"{rng.int(1, 223)}.{rng.int(0, 255)}.{rng.int(0, 255)}.{rng.int(1, 254)}",
+                "ip": u["signup_ip"] if rng.chance(0.7) else (
+                    f"{rng.int(1, 223)}.{rng.int(0, 255)}.{rng.int(0, 255)}.{rng.int(1, 254)}"
+                ),
                 "ua": u["signup_ua"],
                 "device_class": u["device_class"],
                 "created_ts": created,

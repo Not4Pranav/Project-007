@@ -142,8 +142,5 @@ SCENARIOS: dict[str, Scenario] = {
     "mixed": Scenario("mixed", _op_mixed),
     "signup": Scenario("signup", _op_register),
 }
-SCENARIOS["mixed"].name = "mixed"
-
-
 def available() -> list[str]:
     return sorted(SCENARIOS)

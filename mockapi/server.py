@@ -25,8 +25,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from seeds.corpus import DISPOSABLE_DOMAINS as DISPOSABLE
 from seeds.db import connect, migrate
-from seeds.profile import derive
+from seeds.profile import derive, verify_password
 
 MAX_BODY = 64 * 1024
 REG_ITERATIONS = 600  # what a live API would use for a brand-new account
@@ -124,10 +125,7 @@ class Bucket:
             self._hits.clear()
 
 
-DISPOSABLE = {
-    "mailinator.com", "10minutemail.com", "temp-mail.org", "guerrillamail.com", "yopmail.com",
-    "trashmail.com", "throwawaymail.com", "sharklasers.com", "getnada.com", "dispostable.com",
-}
+
 
 
 class Store:
@@ -503,15 +501,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def verify_login(row: sqlite3.Row, password: str) -> bool:
-    import hashlib
-    import hmac
+    """Delegate to the seeder's own verifier.
 
-    algo = row["algo"]
-    if algo == "sha256_fast":
-        got = hashlib.sha256(bytes(row["salt"]) + password.encode()).digest()
-    else:
-        got = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes(row["salt"]), int(row["iterations"]))
-    return hmac.compare_digest(got, bytes(row["hash"]))
+    Duplicating the KDF dispatch here is how a fixture and its target quietly
+    disagree about `sha256_fast` vs `pbkdf2_sha256` and every seeded login 401s.
+    """
+    return verify_password(row["algo"], password, bytes(row["salt"]), bytes(row["hash"]), int(row["iterations"]))
 
 
 class AdmissionServer(ThreadingHTTPServer):

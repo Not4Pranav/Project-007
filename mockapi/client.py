@@ -80,8 +80,13 @@ class ApiClient:
             self._local.ip = ip
         return ip
 
-    def _request(self, method: str, path: str, body: dict | None = None,
-                 token: str | None = None) -> Response:
+    def request(self, method: str, path: str, body: Any = None,
+                extra_headers: dict[str, str] | None = None) -> Response:
+        """Any route, any body, any headers - the shape `load/generic.py` needs."""
+        return self._request(method, path, body, extra_headers=extra_headers)
+
+    def _request(self, method: str, path: str, body: Any = None, token: str | None = None,
+                 extra_headers: dict[str, str] | None = None) -> Response:
         payload = json.dumps(body).encode() if body is not None else None
         headers = {"Accept": "application/json", "User-Agent": self.user_agent,
                    "Connection": "keep-alive", "Host": f"{self.host}:{self.port}"}
@@ -93,6 +98,8 @@ class ApiClient:
         ip = self._thread_ip()
         if ip:
             headers["X-Forwarded-For"] = ip
+        if extra_headers:
+            headers.update({k: v for k, v in extra_headers.items() if v})
         t0 = time.perf_counter()
         last_exc: Exception | None = None
         for _attempt in (0, 1):  # one retry for a stale keep-alive socket

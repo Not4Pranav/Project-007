@@ -33,6 +33,13 @@ def ruff_command() -> list[str] | None:
     return None
 
 
+# Every module the README/Makefile tells people to run with `python3 -m`. A new CLI
+# has to be listed here, which is the point: the two tests below then check its help
+# output and every flag the README promises for it.
+CLI_MODULES = ("seeds.seed", "seeds.report_cli", "seeds.export", "abuse.detector",
+               "mockapi.server", "load.engine")
+
+
 @unittest.skipUnless(ruff_command(), "ruff not installed (`pip install ruff` enables this)")
 class LintTest(unittest.TestCase):
     def test_ruff_is_clean(self) -> None:
@@ -52,8 +59,9 @@ class HygieneTest(unittest.TestCase):
         self.assertEqual(offenders, [], f"print() inside a library module: {offenders}")
 
     def test_no_unfinished_markers(self) -> None:
-        # Built by concatenation so this file does not match its own pattern.
-        bad = re.compile(r"\b(" + "TODO|FIXME|XXX|HACK" + r")\b")
+        # Assembled from split literals so this file cannot match its own pattern.
+        markers = ("TO" "DO", "FIX" "ME", "XX" "X", "HA" "CK")
+        bad = re.compile(r"\b(" + "|".join(markers) + r")\b")
         found = []
         for path in ROOT.rglob("*.py"):
             if ".venv" in path.parts or "__pycache__" in path.parts:
@@ -94,7 +102,7 @@ class ConsistencyTest(unittest.TestCase):
             self.assertFalse([v for v in values if not v.strip()], f"{name} has blank entries")
 
     def test_every_entry_point_has_working_help(self) -> None:
-        for mod in ("seeds.seed", "seeds.report_cli", "abuse.detector", "mockapi.server", "load.engine"):
+        for mod in CLI_MODULES:
             proc = subprocess.run([sys.executable, "-m", mod, "--help"], cwd=ROOT,
                                   capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, f"{mod} --help failed: {proc.stderr[-400:]}")
@@ -102,12 +110,12 @@ class ConsistencyTest(unittest.TestCase):
 
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real
-        option on one of the four entry points."""
+        option on one of the entry points in CLI_MODULES."""
         readme = (ROOT / "README.md").read_text()
         documented = set(re.findall(r"`(--[a-z][a-z0-9-]+)`", readme))
         self.assertGreater(len(documented), 12, "README stopped documenting flags?")
         help_text = ""
-        for mod in ("seeds.seed", "seeds.report_cli", "abuse.detector", "mockapi.server", "load.engine"):
+        for mod in CLI_MODULES:
             help_text += subprocess.run([sys.executable, "-m", mod, "--help"], cwd=ROOT,
                                        capture_output=True, text=True).stdout
         self.assertEqual(sorted(f for f in documented if f not in help_text), [],

@@ -74,6 +74,28 @@ class MathTest(unittest.TestCase):
         self.assertEqual(merged.total, 2000)
         self.assertEqual(merged.lat[:2], rec.lat[:2])
 
+    def test_non_request_outcomes_are_counted_but_never_sampled(self) -> None:
+        """A skipped op is an outcome, not a 0ms response. Before this, a spec whose
+        token was never captured logged 330 x 0.0ms and the stage looked fast."""
+        rec = Recorder()
+        for _ in range(3):
+            rec.note("me", "skipped")
+        for ms in (10.0, 20.0, 30.0):
+            rec.add("me", "ok", ms)
+        stats = summarize(rec, label="x", concurrency=1, seconds=1.0, throttle_is_error=False)
+        self.assertEqual(stats.ops, 6, "skips are still ops")
+        self.assertEqual(stats.p50, 20.0, "the median must come from real responses")
+        self.assertEqual(stats.per_op["me"]["n"], 3.0, "n counts latency samples")
+        self.assertEqual(stats.per_op["me"]["kinds"], {"skipped": 3, "ok": 3})
+
+        # and it survives the rollup merge, which is where per-op outcomes are read from
+        rolled = Recorder()
+        rolled.merge(rec)
+        self.assertEqual(rolled.total, 6)
+        mix = summarize(rolled, label="o", concurrency=1, seconds=1.0,
+                        throttle_is_error=False).per_op["me"]["kinds"]
+        self.assertEqual(mix, {"skipped": 3, "ok": 3}, "merge() dropped by_op_kind once")
+
     def test_throttle_can_count_as_error(self) -> None:
         rec = Recorder()
         rec.add("login", "throttled", 12.0)

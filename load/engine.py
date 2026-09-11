@@ -32,6 +32,11 @@ from .scenarios import SCENARIOS, LoadOptions, available
 
 MAX_SAMPLES = 400_000
 
+# Outcomes that never became a request. They must be counted (a skipped authed op is a
+# finding) but never sampled as latency: a spec where the token was never captured logged
+# 330 x 0.00ms into the percentiles, which reads as "fast" instead of "broken".
+NON_REQUEST_KINDS = ("skipped", "spec_error")
+
 
 @dataclass
 class Recorder:
@@ -41,6 +46,14 @@ class Recorder:
     lat: array = field(default_factory=lambda: array("d"))
     by_kind: Counter = field(default_factory=Counter)
     by_op: dict[str, array] = field(default_factory=lambda: defaultdict(array))
+    by_op_kind: Counter = field(default_factory=Counter)
+
+    def note(self, op: str, kind: str) -> None:
+        """Count an outcome without contributing a latency sample."""
+        with self.lock:
+            self.by_kind[kind] += 1
+            self.by_op.setdefault(op, array("d"))
+            self.by_op_kind[(op, kind)] += 1
 
     def add(self, op: str, kind: str, ms: float) -> None:
         with self.lock:
@@ -50,6 +63,7 @@ class Recorder:
             self.lat.append(ms)
             self.by_kind[kind] += 1
             self.by_op.setdefault(op, array("d")).append(ms)
+            self.by_op_kind[(op, kind)] += 1
 
     dropped: int = 0
 
@@ -65,6 +79,7 @@ class Recorder:
             else:
                 self.dropped += len(other.lat)
             self.by_kind.update(other.by_kind)
+            self.by_op_kind.update(other.by_op_kind)
             for op, vals in other.by_op.items():
                 self.by_op.setdefault(op, array("d")).extend(vals)
 
@@ -112,8 +127,10 @@ def summarize(rec: Recorder, *, label: str, concurrency: int, seconds: float,
     errs = sum(kinds.get(k, 0) for k in err_kinds)
     per_op = {}
     for op, vals in rec.by_op.items():
+        mix = {k[1]: v for k, v in rec.by_op_kind.items() if k[0] == op}
         per_op[op] = {
             "n": float(len(vals)),
+            "kinds": mix,
             "p50": round(quantile(vals, 0.5), 2),
             "p95": round(quantile(vals, 0.95), 2),
             "p99": round(quantile(vals, 0.99), 2),
@@ -209,7 +226,7 @@ def run_stage(client: ApiClient, scenario, opts: LoadOptions, *, concurrency: in
     problems: list[str] = []
 
     def worker(idx: int) -> None:
-        ctx = {"rnd": random.Random(seed * 1_000_003 + idx), "token": None, "cursor": None}
+        ctx: dict = {"rnd": random.Random(seed * 1_000_003 + idx)}
         next_due = time.monotonic()
         try:
             barrier.wait(timeout=60)
@@ -224,12 +241,17 @@ def run_stage(client: ApiClient, scenario, opts: LoadOptions, *, concurrency: in
                     continue
                 next_due += per_worker
             try:
+                t0 = time.perf_counter()
                 kind, ms, op = scenario.run(client, ctx, opts)
             except Exception as exc:
-                kind, ms, op = "transport", 0.0, scenario.name
+                # time-to-failure is a real observation; a hardcoded 0.0 would be a gift
+                kind, ms, op = "transport", (time.perf_counter() - t0) * 1000.0, scenario.name
                 if len(problems) < 5:
                     problems.append(f"{type(exc).__name__}: {exc}")
-            rec.add(op, kind, ms)
+            if kind in NON_REQUEST_KINDS:
+                rec.note(op, kind)
+            else:
+                rec.add(op, kind, ms)
             if think_ms:
                 time.sleep(think_ms / 1000.0)
 
@@ -249,6 +271,10 @@ def run_stage(client: ApiClient, scenario, opts: LoadOptions, *, concurrency: in
         stats.per_op["scenario_bug"] = {"n": float(len(problems)), "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0}
         print(f"  [{label}] scenario raised {len(problems)}x, e.g. {problems[0]}", file=sys.stderr)
     return stats, rec
+
+
+def _breach_suffix(payload: dict) -> str:
+    return " — " + "; ".join(payload["slo_breaches"]) if payload["slo_breaches"] else ""
 
 
 def write_report(out_dir: Path, payload: dict) -> tuple[Path, Path]:
@@ -272,14 +298,16 @@ def write_report(out_dir: Path, payload: dict) -> tuple[Path, Path]:
         lines.append(f"| {s['label']} | {s['concurrency']} | {s['ops']:,} | {s['rps']:.0f} | {s['mean']:.1f} "
                      f"| {s['p50']:.1f} | {s['p95']:.1f} | {s['p99']:.1f} | {s['max']:.1f} | {s['errors']:.2f} "
                      f"| {s['throttled']:.2f} |")
-    lines += ["", "## per-op latency (ms)", "", "| stage | op | n | p50 | p95 | p99 | max |",
-              "|---|---|---:|---:|---:|---:|---:|"]
+    lines += ["", "## per-op latency (ms)", "",
+              "| stage | op | n | p50 | p95 | p99 | max | outcomes |",
+              "|---|---|---:|---:|---:|---:|---:|---|"]
     for s in payload["stages"]:
         for op, d in sorted(s["per_op"].items()):
             if op.startswith("__"):
                 continue
+            mix = ", ".join(f"{k} {v:,}" for k, v in sorted(d["kinds"].items(), key=lambda kv: -kv[1]) if v)
             lines.append(f"| {s['label']} | {op} | {int(d['n']):,} | {d['p50']:.1f} | {d['p95']:.1f} "
-                         f"| {d['p99']:.1f} | {d['max']:.1f} |")
+                         f"| {d['p99']:.1f} | {d['max']:.1f} | {mix} |")
     lines += ["", "## outcome mix", ""]
     for s in payload["stages"]:
         mix = ", ".join(f"{k} {v:,}" for k, v in sorted(s["kinds"].items(), key=lambda kv: -kv[1]) if v)
@@ -288,7 +316,7 @@ def write_report(out_dir: Path, payload: dict) -> tuple[Path, Path]:
         lines += ["", "## server-side metrics (what the target saw)", "", "```json",
                   json.dumps(payload["server_metrics"], indent=2)[:3000], "```"]
     lines += ["", f"- SLO `{payload['slo_spec'] or 'none'}` on `{payload['slo_scope']}` stage: "
-              f"**{payload['slo_result']}**{' — ' + '; '.join(payload['slo_breaches']) if payload['slo_breaches'] else ''}",
+              f"**{payload['slo_result']}**{_breach_suffix(payload)}",
               f"- overall: {payload['overall']['ops']:,} ops, p95 {payload['overall']['p95']:.1f} ms, "
               f"p99 {payload['overall']['p99']:.1f} ms, errors {payload['overall']['errors']:.2f}%", ""]
     mp.write_text("\n".join(lines))
@@ -301,7 +329,9 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m load.engine", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
-    p.add_argument("--scenario", default="mixed", choices=available())
+    p.add_argument("--scenario", default="mixed", choices=available(),
+                   help="ignored when --spec is given")
+    p.add_argument("--spec", default="", help="JSON op spec for a real API (see load/generic.py)")
     p.add_argument("--mix", default="register=4,login=40,feed=45,post=11", help="weights for --scenario mixed")
     p.add_argument("--stages", default="25,100,250", help="concurrency levels, or conc:seconds")
     p.add_argument("--stage-seconds", type=float, default=15.0)
@@ -336,29 +366,48 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     idents, ident_source = identifier_pool(a)
-    if a.scenario in ("login", "mixed", "post") and not idents:
+    if a.scenario in ("login", "mixed", "post") and not idents and not a.spec:
         print("no identifiers for the login path; pass --fixture-db var/test.db (or seed the target)",
               file=sys.stderr)
         return 2
 
     mix: dict[str, float] = {}
-    for chunk in filter(None, a.mix.replace(" ", "").split(",")):
-        k, _, v = chunk.partition("=")
-        if k not in SCENARIOS:
-            print(f"unknown scenario in --mix: {k} (have {', '.join(available())})", file=sys.stderr)
+    spec = None
+    if a.spec:
+        from .generic import Spec, scenario_from
+
+        try:
+            spec = Spec.load(a.spec)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"could not read --spec {a.spec}: {exc}", file=sys.stderr)
             return 2
-        mix[k] = float(v)
+        scenario = scenario_from(a.spec)
+        a.scenario = spec.name
+        if spec.base_url and a.base_url == "http://127.0.0.1:8000":
+            a.base_url = spec.base_url  # the spec may name its own target
+        mix = {o.name: o.weight for o in spec.ops}
+    else:
+        for chunk in filter(None, a.mix.replace(" ", "").split(",")):
+            k, _, v = chunk.partition("=")
+            if k not in SCENARIOS:
+                print(f"unknown scenario in --mix: {k} (have {', '.join(available())})", file=sys.stderr)
+                return 2
+            mix[k] = float(v)
 
     opts = _LO(password=a.password, identifiers=idents, register_domain=a.register_domain,
                verify_first=a.verify_first, count_throttled_as_error=a.count_throttled_as_error,
                mix_weights=mix)
-    scenario = SCENARIOS[a.scenario]
+    if spec is None:
+        scenario = SCENARIOS[a.scenario]
     stages = parse_stages(a.stages)
     slo = parse_slo(a.slo)
 
     print(f"target      {a.base_url}   scenario={a.scenario}   identifiers={len(idents):,} ({ident_source})")
-    print(f"stages      {[c for c, _ in stages]} x {a.stage_seconds}s "
-          f"(warmup {a.warmup_seconds}s excluded)   pacing={'closed loop' if not a.rps else f'{a.rps:.0f} rps total'}")
+    if spec is not None:
+        print(f"spec ops    {spec.describe()}")
+    plan = ", ".join(f"{c}:{secs or a.stage_seconds:g}s" for c, secs in stages)
+    print(f"stages      {plan} (warmup {a.warmup_seconds}s excluded)   "
+          f"pacing={'closed loop' if not a.rps else f'{a.rps:.0f} rps total'}")
     print()
     head = (f"{'stage':>8} {'conc':>5} {'ops':>9} {'rps':>7} {'mean':>7} {'p50':>7} {'p95':>8} "
             f"{'p99':>9} {'max':>9} {'err%':>6} {'429%':>6}")
@@ -383,6 +432,12 @@ def main(argv: list[str] | None = None) -> int:
               f"{stats.p95:>8.1f} {stats.p99:>9.1f} {stats.max:>9.1f} {stats.errors:>6.2f} {stats.throttled:>6.2f}")
         kinds = ", ".join(f"{k} {v:,}" for k, v in sorted(stats.kinds.items(), key=lambda kv: -kv[1]) if v)
         print(f"{'':>8} {kinds}")
+        worst = [(op, kinds_) for op, kinds_ in
+                 ((o, {k: v for (oo, k), v in rec.by_op_kind.items() if oo == o}) for o in stats.per_op)
+                 if kinds_ and set(kinds_) - {"ok"}]
+        for op, kinds_ in worst[:4]:
+            detail = ", ".join(f"{k} {v:,}" for k, v in sorted(kinds_.items(), key=lambda kv: -kv[1]))
+            print(f"{'':>8} {op}: {detail}")
         if stats.dropped:
             print(f"{'':>8} (sample cap reached; {stats.dropped:,} observations not kept)")
 
@@ -404,12 +459,18 @@ def main(argv: list[str] | None = None) -> int:
         "server_metrics": server if isinstance(server, dict) else None,
         "generated": datetime.now(UTC).isoformat(timespec="seconds"),
     }
+    spec_errors = sum(s.kinds.get("spec_error", 0) for s in stage_stats)
+    if spec_errors:
+        print(f"\nspec error   {spec_errors} op(s) could not be rendered - fix --spec and rerun",
+              file=sys.stderr)
     mp, jp = write_report(Path(a.out), payload)
     print()
     print(f"report      {mp}")
     print(f"raw         {jp}")
     if slo:
         print(f"slo         {a.slo_scope}: {'PASS' if not breaches else 'FAIL -> ' + '; '.join(breaches)}")
+    if spec_errors:
+        return 3
     return 4 if breaches else 0
 
 

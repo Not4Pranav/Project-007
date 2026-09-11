@@ -11,7 +11,6 @@ from .distribution import Cohort, verify_delay_seconds
 from .rng import Rng
 
 SYMBOLS = "!@#$%&*"
-PASSWORD_ITERATIONS = 1_200  # fixture default; override per run
 
 
 @dataclass(slots=True)
@@ -148,6 +147,15 @@ def make_email_local(rng: Rng, username: str, first: str, last: str) -> str:
     return _normalize(local).replace("-", ".")
 
 
+def _display_name(rng: Rng, first: str, last: str, username: str) -> str:
+    roll = rng.raw.random()
+    if roll < 0.25:
+        return f"{first} {last[0]}."
+    if roll < 0.95:
+        return f"{first} {last}"
+    return username
+
+
 def make_bio(rng: Rng) -> str:
     tpl = str(rng.pick(corpus.BIO_TEMPLATES))
     return tpl.format(
@@ -265,7 +273,7 @@ def build_profile(
         username=username,
         email=email,
         email_domain=domain,
-        display_name=f"{first} {last[0]}." if rng.chance(0.25) else (f"{first} {last}" if rng.chance(0.7) else username),
+        display_name=_display_name(rng, first, last, username),
         dob=make_dob(rng),
         country=country,
         region=region_name,

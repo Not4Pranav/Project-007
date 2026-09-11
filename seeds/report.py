@@ -4,13 +4,9 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from .corpus import DISPOSABLE_DOMAINS as DISPOSABLE_HINT
 from .db import get_meta
 from .text import entropy, username_template
-
-DISPOSABLE_HINT = (
-    "mailinator.com", "10minutemail.com", "temp-mail.org", "guerrillamail.com", "yopmail.com",
-    "trashmail.com", "throwawaymail.com", "sharklasers.com", "getnada.com", "dispostable.com",
-)
 
 
 def _fmt_ts(ts: int | None) -> str:
@@ -100,7 +96,7 @@ def render(conn, counts: dict[str, int] | None = None) -> str:
         add(f"  {r['d']:<28}{r['c']:>8,}  {pct(r['c'], users)}{tag}")
     disp = conn.execute(
         f"SELECT COUNT(*) c FROM users WHERE email_domain IN ({','.join('?' * len(DISPOSABLE_HINT))})",
-        DISPOSABLE_HINT).fetchone()["c"]
+        tuple(sorted(DISPOSABLE_HINT))).fetchone()["c"]
     add(f"  {'disposable total':<28}{disp:>8,}  {pct(disp, users)}")
 
     add("")

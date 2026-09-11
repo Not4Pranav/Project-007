@@ -93,6 +93,9 @@ EMAIL_DOMAINS: tuple[tuple[str, int, bool], ...] = (
 )
 
 DISPOSABLE_DOMAINS: frozenset[str] = frozenset(d for d, _w, free in EMAIL_DOMAINS if not free)
+# The one list every consumer uses (report, abuse rules, the mock API's opt-in
+# block). Three hand-copied versions drifted on the second new domain added.
+FREE_DOMAINS: frozenset[str] = frozenset(d for d, _w, free in EMAIL_DOMAINS if free)
 
 # (country, region, IANA-ish tz, utc offset hours, locale, population weight)
 REGIONS: tuple[tuple[str, str, str, int, str, int], ...] = (
@@ -162,15 +165,6 @@ SOURCES: tuple[tuple[str, int], ...] = (
     ("ads", 14),
     ("campaign", 9),
     ("api", 4),
-)
-
-USERNAME_STYLES: tuple[tuple[str, int], ...] = (
-    ("first.last.num", 26),        # aisha.bianchi41
-    ("adjective_noun_num", 22),    # lunar_fjord_92
-    ("handle", 20),                # quietmaple
-    ("initial_last_num", 14),      # rrossi88
-    ("nickname_repeat", 9),        # kai-kai-kai
-    ("name_year", 9),              # marco2001
 )
 
 # Templates used by the injected automation cohort: same shape, digit suffix

@@ -17,6 +17,7 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from seeds.corpus import DISPOSABLE_DOMAINS
 from seeds.db import connect, migrate
 from seeds.text import email_local_part, entropy, ip_prefix24, username_template
 
@@ -25,10 +26,6 @@ BOT_UA = re.compile(
     re.I,
 )
 
-DISPOSABLE = (
-    "mailinator.com", "10minutemail.com", "temp-mail.org", "guerrillamail.com", "yopmail.com",
-    "trashmail.com", "throwawaymail.com", "sharklasers.com", "getnada.com", "dispostable.com",
-)
 
 RULES: dict[str, float] = {
     "bot_user_agent": 0.45,
@@ -129,7 +126,7 @@ class RuleEngine:
 
         # --- email domain + local-part shape
         for u in users:
-            if (u["email_domain"] or "").lower() in DISPOSABLE:
+            if (u["email_domain"] or "").lower() in DISPOSABLE_DOMAINS:
                 flags[u["id"]].add("disposable_email")
                 if not u["has_phone"]:
                     flags[u["id"]].add("no_phone_disposable")
@@ -188,7 +185,9 @@ class RuleEngine:
                 # `SELECT user_id, MAX(score) FROM flags GROUP BY 1` is enough
                 # to build a queue; the rule's own weight goes in detail.
                 rows.append((uid, r, round(s, 4), f"rule_weight={RULES[r]:.2f}", run_ts))
-        self.conn.executemany("INSERT OR REPLACE INTO flags(user_id, rule, score, detail, run_ts) VALUES(?,?,?,?,?)", rows)
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO flags(user_id, rule, score, detail, run_ts) VALUES(?,?,?,?,?)", rows
+        )
         self.conn.execute("COMMIT")
         return kept, total
 
@@ -232,11 +231,18 @@ def main(argv: list[str] | None = None) -> int:
 
     conn = connect(a.db)
     migrate(conn)
-    eng = RuleEngine(conn, allow_domains=frozenset(a.allow_domain), velocity_window=a.velocity_window, velocity_min=a.velocity_min,
-                     template_min=a.template_min, fan_in_min=a.fan_in_min,
-                     instant_verify_s=a.instant_verify_s, entropy_floor=a.entropy_floor,
-                     min_rules=a.min_rules,
-                     batch_seconds_per_account=a.batch_seconds_per_account)
+    eng = RuleEngine(
+        conn,
+        allow_domains=frozenset(a.allow_domain),
+        velocity_window=a.velocity_window,
+        velocity_min=a.velocity_min,
+        template_min=a.template_min,
+        fan_in_min=a.fan_in_min,
+        instant_verify_s=a.instant_verify_s,
+        entropy_floor=a.entropy_floor,
+        min_rules=a.min_rules,
+        batch_seconds_per_account=a.batch_seconds_per_account,
+    )
     t0 = time.perf_counter()
     users = eng.load()
     flags = eng.hits(users)

@@ -45,6 +45,15 @@ smoke: ## fast path: 4k accounts, 3 short stages, ~40s total
 	@echo "now: make api  (then, in another shell) "
 	@echo "     python3 -m load.engine --fixture-db var/smoke.db --stages 20,60 --stage-seconds 8"
 
+export: ## write bulk csv/jsonl + import.postgres.sql for $(DB) into var/out
+	$(PY) $(W) -m seeds.export --db $(DB) --out var/out \
+	  --tables users,credentials,events,invite_edges --format csv,jsonl
+
+load-spec: ## drive the API at $(PORT) from a JSON scenario spec instead of built-in ops
+	$(PY) $(W) -m load.engine --base-url http://127.0.0.1:$(PORT) \
+	  --spec docs/examples/mockapi.load.json --fixture-db $(DB) --stages $(STAGES) \
+	  --slo "$(SLO)"
+
 demo: seed detect ## seed at full size, then scan it
 
 test: ## the whole suite, no installs

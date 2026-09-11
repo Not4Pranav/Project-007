@@ -33,9 +33,6 @@ class Rng:
     def pick(self, items: Sequence) -> object:
         return self._r.choice(items)
 
-    def sample(self, items: Sequence, k: int) -> list:
-        return self._r.sample(list(items), k=min(k, len(items)))
-
     def weighted(self, pairs: Sequence[tuple[object, float]]) -> object:
         """`pairs` is a sequence of (value, weight)."""
         return self._r.choices([p[0] for p in pairs], weights=[p[1] for p in pairs], k=1)[0]
@@ -59,14 +56,6 @@ class Rng:
     def hex_id(self, nbytes: int = 8) -> str:
         return "".join(self._r.choice("0123456789abcdef") for _ in range(nbytes * 2))
 
-    def words(self, n: int) -> list[str]:
-        return [self._r.choice(_SYLLABLES) for _ in range(n)]
-
-
-_SYLLABLES: tuple[str, ...] = (
-    "bar", "cel", "dor", "en", "fa", "gro", "ha", "il", "jen", "ko", "lo", "mi",
-    "nor", "pa", "qua", "rin", "sel", "to", "un", "ver", "wa", "yk", "zor",
-)
 
 
 def _cumsum(weights: Sequence[float]) -> list[float]:

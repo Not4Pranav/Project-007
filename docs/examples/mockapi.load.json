@@ -1,0 +1,40 @@
+{
+  "name": "mockapi",
+  "_comment": "Drives the bundled fixture API through the generic spec path - the same file shape you would point at your own service.",
+  "ops": [
+    {
+      "name": "login",
+      "weight": 45,
+      "method": "POST",
+      "path": "/auth/login",
+      "json": {"identifier": "{{ident}}", "password": "{{password}}"},
+      "expect": [200, 429],
+      "capture": {"token": "token"}
+    },
+    {
+      "name": "feed",
+      "weight": 35,
+      "method": "GET",
+      "path": "/feed",
+      "query": {"limit": "{{feed_limit}}", "cursor": "{{cursor}}"},
+      "expect": [200]
+    },
+    {
+      "name": "me",
+      "weight": 10,
+      "method": "GET",
+      "path": "/users/me",
+      "headers": {"Authorization": "Bearer {{token}}"},
+      "requires": ["token"],
+      "expect": [200]
+    },
+    {
+      "name": "signup",
+      "weight": 10,
+      "method": "POST",
+      "path": "/auth/register",
+      "json": {"email": "{{email}}", "username": "{{username}}", "password": "{{password}}"},
+      "expect": [201, 409, 429]
+    }
+  ]
+}

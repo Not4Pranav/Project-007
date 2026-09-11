@@ -12,7 +12,8 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 60+ tests, no install step
+make test      # 80 tests, no install step
+make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
 
 ## Layout
@@ -22,7 +23,9 @@ make test      # 60+ tests, no install step
 | `seeds/` | the generator: profile shapes, signup curve, schema, writer, report |
 | `abuse/detector.py` | scores accounts for automated-signup signals, grades itself against fixture labels |
 | `mockapi/` | a throwaway register/login/feed app so the harness has an honest target |
-| `load/` | concurrency-ramped load engine, scenario library, SLO gate, markdown+JSON reports |
+| `load/` | concurrency-ramped load engine, scenario library (built-in or JSON `--spec`), SLO gate, reports |
+| `seeds/export.py` | bulk CSV/JSONL artifacts + a generated Postgres loader, for staging and pytest |
+| `docs/recipes.md` | the wiring: Postgres import, pytest fixtures from JSONL, CI gate, spec-driven load |
 | `tests/` | the suite (`unittest`, no pytest needed) |
 | `var/` | generated databases and reports (gitignored) |
 
@@ -154,6 +157,12 @@ you know. The 47 false positives are legitimate campaign-burst accounts that sha
 a subnet and register minutes apart; that ambiguity is not a bug to fix here, it
 is the reason real moderation keeps a human in the loop.
 
+One shape worth knowing before you assert on the graph: `invited_by` never points
+*forward by id*, but the injected cohort's edges can point at an inviter who signed
+up *later* (`--inject-bots` writes the amplifier last, on purpose — that is what a
+back-filled invite code looks like in a database). All of those rows are still
+flagged. `docs/recipes.md` has the query and the number for the fixture as shipped.
+
 `--allow-domain loadtest.invalid` keeps your own synthetic traffic out of the
 scoring. This matters more than it looks: accounts created *through* the API by
 the load engine come from one IP, with digit-walking names and instant
@@ -195,6 +204,51 @@ A) every worker shares one IP                 B) --ip-pool 200
 A says "half your logins get throttled". B says "no — that was one IP; the real
 cost at 250 connections is write contention, and throughput drops". You need both
 to read your limiter correctly.
+
+## Getting the accounts out of the fixture
+
+`python3 -m seeds.export` turns the database into bulk artifacts, because the point of
+a fixture this size is to be *loaded somewhere else*:
+
+```bash
+python3 -m seeds.export --db var/test.db --out var/out \
+  --tables users,credentials,events,invite_edges --format csv,jsonl
+```
+
+- **CSV uses Postgres `\copy` conventions** — `\N` for NULL, `\x`-hex for blobs — and the
+  directory gets an `import.postgres.sql` with the `\copy` lines, the DDL types to create
+  first, and the `setval` bump that stops your app's next `INSERT` colliding with a
+  fixture id. `--split` writes 50k-row chunks so a big import can run in parallel.
+- **JSONL is for test harnesses**: one object per line, `json.loads` it, done. It is also
+  the labels ride along, so a pytest parametrization can assert against your detector's
+  verdict without a database handle: `users.is_synthetic_abuse` is always there, and
+  `--tables flags` adds the detector's per-rule rows (`user_id, rule, score, detail`),
+  which is one line per piece of evidence — the aggregate you want in an assertion is
+  `max(score)` per user, and `--format jsonl` keeps the JSON `detail` intact per row.
+- **No plaintext credentials, by construction.** `credentials.csv` carries
+  `algo,salt,iterations,hash` exactly as stored — a fixture that ships a recoverable
+  password is a fixture someone will copy into production.
+- `export.json` is the manifest: row counts per table, the seed params, and
+  `fixture_hash`, so an import can be tied to the seed that produced it.
+
+## Driving a non-mock API
+
+`load/scenarios.py` knows this repo's routes. A `--spec` file knows yours, so the ramped
+stages, warmup exclusion, per-op percentiles, outcome accounting and SLO gate apply to
+any HTTP API — no Python edit:
+
+```bash
+python3 -m load.engine --base-url https://staging.example.com \
+  --spec docs/examples/mockapi.load.json --stages 25,100:15 --slo "p95_ms=250,error_rate_pct=0.5"
+```
+
+Ops are weighted (`weight: 0` = never picked), `capture` stores a response field into the
+worker's state (`{"token": "access_token"}`), `{{token}}` interpolates it back into any
+path/header/query/body, and `requires` counts an op as `skipped` when its dependency was
+never captured — which is the difference between a run that measures authed reads and one
+that measures how fast your API returns 401. Statuses outside `expect` (default
+`[200, 201, 204]`) are counted as failures, so a 401 you expected has to be listed. The report's `outcomes` column prints the mix per op, so a single
+broken op is attributable instead of being a percentage in a header.
 
 ## Pointing it at your app
 
