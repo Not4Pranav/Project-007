@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import dataclasses
 import http.client
+import inspect
 import json
+import os
 import re
 import shutil
 import socket
 import sqlite3
+import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -28,7 +32,8 @@ from unittest import mock
 from urllib.parse import quote
 
 from console import ops
-from console.server import DUMP_NAME, Handler, serve
+from console.server import DUMP_NAME, Handler, bundle_home, serve
+from console.server import main as console_main
 from console.settings import Settings, SettingsError, apply_updates, load, safe_fixture_path, save, validate
 from seeds import roster
 from tests._support import TMP, seed_db
@@ -759,6 +764,57 @@ class JoinFlowTest(unittest.TestCase):
         total = int(c.execute("SELECT COUNT(*) n FROM memberships").fetchone()["n"])
         c.close()
         self.assertEqual(status["tables"]["memberships"], total)
+
+
+class FrozenBundleTest(unittest.TestCase):
+    """The .exe is the thing the user double-clicks, and it is the one build this box cannot
+    run, so the two rules it depends on are checked here instead."""
+
+    def test_the_bundle_anchors_relative_paths_to_its_own_folder(self) -> None:
+        """Every settings path is relative (`var/console.json`, `var/test.db`), which is fine
+        for run.bat — it cds first — and wrong for a shortcut that launches the .exe from
+        wherever it likes: the tool would seed an empty fixture in the wrong folder and look
+        like it had lost the accounts."""
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "SignupFixtureLab.exe"
+            exe.write_bytes(b"MZ")
+            elsewhere = Path(tmp) / "elsewhere"
+            elsewhere.mkdir()
+            cwd = Path.cwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch.object(sys, "frozen", True, create=True), \
+                        mock.patch.object(sys, "executable", str(exe)):
+                    self.assertEqual(bundle_home(), exe.resolve().parent)
+                with mock.patch.object(sys, "frozen", None, create=True):
+                    self.assertIsNone(bundle_home(), "from source nothing moves")
+            finally:
+                os.chdir(cwd)
+
+    def test_the_first_run_seeds_the_configured_five_not_the_default_population(self) -> None:
+        """`users` is 4,000 by default so the load tests have something to load. Reusing that
+        number for the double-click's first run meant a fresh install spent seconds building
+        4,000 accounts and wrote a 4,000-line list — the bug this pins down."""
+        from console.server import bootstrap_settings
+
+        seeded = bootstrap_settings(Settings())
+        self.assertEqual((Settings().users, Settings().bootstrap_accounts, seeded.users), (4000, 5, 5))
+        self.assertEqual(seeded.db, Settings().db, "only the count changes; the paths are the user's")
+        self.assertEqual(bootstrap_settings(Settings(bootstrap_accounts=0)).users, 1,
+                         "zero would otherwise seed an empty fixture and call it setup")
+        self.assertEqual(bootstrap_settings(Settings(users=3, bootstrap_accounts=50)).users, 50,
+                         "the list size wins in both directions")
+        src = inspect.getsource(console_main)
+        self.assertIn("bootstrap_settings(settings)", src, "main must go through the helper")
+
+    def test_main_anchors_before_it_reads_the_settings(self) -> None:
+        """Ordering matters: chdir after `load_settings` and the first run already used the
+        wrong folder."""
+        src = inspect.getsource(console_main)
+        self.assertLess(src.index("bundle_home()"), src.index("load_settings(path)"))
+        self.assertIn("os.chdir(home)", src)
+        # and the launcher's flags stay the defaults only for a bundle
+        self.assertIn('default=frozen', src)
 
 
 class ResolveServerTest(unittest.TestCase):

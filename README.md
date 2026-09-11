@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 197 tests, no install step
+make test      # 200 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -85,17 +85,24 @@ python -m console --bootstrap --open-browser
 ```
 
 which opens `http://127.0.0.1:8010/`. Anything you type after the script is passed through,
-so `run.bat --port 8090` works. `--bootstrap` is the first-run setup: with no fixture
-database yet it generates the configured number of accounts (Settings >
-`bootstrap_accounts`, 5 by default) and writes them to `var\accounts.txt`, so the tabs open
-with a usable account list instead of an empty one. It never touches an existing database —
-that flag is a no-op once `var\test.db` exists, and the Generator tab is how you add to it.
+so `run.bat --port 8090` works. If the `python` on PATH is the Microsoft Store stub rather than
+a real interpreter, the script says so instead of failing quietly.
+
+`--bootstrap` is the first-run setup: with no fixture database yet it generates
+`bootstrap_accounts` accounts (5 — the *list* size, deliberately not the Generator tab's
+`users`, which defaults to 4,000 because load tests want that), and writes those names to
+`var\accounts.txt` so the tabs open with something readable instead of an empty form. More
+accounts come from Generator Mode, which appends: the new ones are saved alongside the five,
+with ids that continue, and the list grows by exactly the new accounts. `--bootstrap` never
+touches an existing database — it is a no-op once `var\test.db` exists.
 
 `build_exe.bat` is the optional next step: it runs PyInstaller and produces
 `dist\SignupFixtureLab.exe`, one file you can copy wherever you work. It has to be run on
 Windows — PyInstaller is not a cross-compiler, so a binary built on Linux or macOS will not
 execute here. The `.exe` sets the same defaults `run.bat` passes (it has no place to type
-flags), and it still writes `var\` next to itself, so keep it somewhere writable.
+flags) and works from its own folder — it `chdir`s to where the `.exe` sits, so a Start-menu
+shortcut cannot seed an empty `var\` somewhere else and make your accounts look missing. Keep
+it somewhere writable (not Program Files).
 
 Neither one installs anything, needs admin rights, or opens a port beyond `127.0.0.1`.
 
@@ -552,11 +559,11 @@ does not exist yet**, then does nothing on every later start. The `db`, `api_por
 knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
 or base-URL flag to point at somebody else's system.
 
-The suite behind all of this is `tests/test_console.py` (58 tests: the settings rules, the
+The suite behind all of this is `tests/test_console.py` (61 tests: the settings rules, the
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in
-`tests/test_mockapi.py`, and the repo is at 197 under `make test`.
+`tests/test_mockapi.py`, and the repo is at 200 under `make test`.
 
 ## Limits, honestly
 

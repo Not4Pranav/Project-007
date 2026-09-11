@@ -32,7 +32,10 @@ pause
 goto :end
 
 :oldpython
-echo This tool needs Python 3.11+; the interpreter on PATH is older than that.
+echo A "python" was found on PATH but it is not a usable Python 3.11+.
+echo The Microsoft Store stub that ships with Windows answers --version and then opens the
+echo Store; if that is what happened, install from https://www.python.org/downloads/ and tick
+echo "Add python.exe to PATH", or make sure the "py" launcher is installed.
 pause
 goto :end
 

@@ -31,9 +31,10 @@ if errorlevel 1 (echo build failed & pause & exit /b 1)
 
 echo.
 echo Built  dist\SignupFixtureLab.exe
-echo   Copy that one file wherever you want to work. It writes var\ next to itself on first
-echo   run, so keep it somewhere you can write to (not Program Files). Double-clicking it
-echo   starts the console, seeds the first accounts and opens http://127.0.0.1:8010/.
+echo   Copy that one file wherever you want to work. It works from its own folder: var\ is
+echo   written next to the .exe even when a shortcut starts it from somewhere else, so keep it
+echo   somewhere you can write to (not Program Files). Double-clicking it starts the console,
+echo   seeds the first accounts and opens http://127.0.0.1:8010/.
 echo   Stop it with Ctrl-C in the window it opens, or by closing that window.
 pause
 endlocal

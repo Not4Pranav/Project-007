@@ -155,12 +155,22 @@ class ConsistencyTest(unittest.TestCase):
             self.assertTrue((ROOT / pkg / "__init__.py").is_file(),
                             f"--collect-submodules {pkg}: no such package to collect")
         # A bundled .exe has no interpreter to hand a child process, so every module the
-        # console runs has to be called in-process. `subprocess` anywhere in the runtime
+        # console runs has to be called in-process. Spawning anywhere in the runtime
         # packages would turn build_exe.bat into an .exe that works until you press a button.
-        spawners = [str(path.relative_to(ROOT)) for pkg in ("console", "load", "seeds", "mockapi", "abuse")
+        spawn_calls = ("import subprocess", "os.system(", "os.popen(", "os.exec", "posix_spawn",
+                       "os.spawn")
+        spawners = [f"{path.relative_to(ROOT)}:{needle}" for pkg in
+                    ("console", "load", "seeds", "mockapi", "abuse")
                     for path in sorted(ROOT.joinpath(pkg).glob("*.py"))
-                    if "import subprocess" in path.read_text() or "sys.executable" in path.read_text()]
+                    for needle in spawn_calls if needle in path.read_text()]
         self.assertEqual(spawners, [], f"{spawners} would break the frozen build")
+        # `sys.executable` is allowed for exactly one thing: finding the .exe's own folder, so
+        # relative paths land next to it. Anywhere else and it is a re-exec in disguise.
+        readers = [str(path.relative_to(ROOT)) for pkg in ("console", "load", "seeds", "mockapi", "abuse")
+                   for path in sorted(ROOT.joinpath(pkg).glob("*.py")) if "sys.executable" in path.read_text()]
+        self.assertEqual(readers, ["console/server.py"], f"unexpected sys.executable readers: {readers}")
+        server = (ROOT / "console" / "server.py").read_text()
+        self.assertEqual(server.count("sys.executable"), 1, "only bundle_home() may name the interpreter path")
 
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real

@@ -732,6 +732,33 @@ def serve(port: int, host: str, settings_path: Path, verbose: bool = False,
     return httpd
 
 
+def bundle_home() -> Path | None:
+    """The directory a frozen bundle must treat as home, or None when running from source.
+
+    Every path the settings hold is relative (`var/console.json`, `var/test.db`,
+    `var/accounts.txt`), which is exactly right for `run.bat` — it `cd`s to its own folder
+    first. A double-clicked .exe has no such guarantee: a Start-menu shortcut, "Run as
+    administrator", or launching it from a cmd sitting elsewhere gives a different working
+    directory, and the tool would then create an empty `var\` somewhere else and look like it
+    had deleted the accounts. Anchor the bundle to the folder holding the .exe instead.
+    """
+    if not getattr(sys, "frozen", False):  # PyInstaller sets this
+        return None
+    return Path(sys.executable).resolve().parent
+
+
+def bootstrap_settings(settings: Settings) -> Settings:
+    """The first run seeds exactly `bootstrap_accounts` accounts — not the Generator tab's number.
+
+    `users` defaults to 4,000 because a load fixture wants thousands, and a deliberate
+    Generate click should honour it. But `--bootstrap` runs before anyone clicks anything: on a
+    fresh machine, double-clicking the tool would otherwise spend seconds building 4,000
+    accounts and write a 4,000-line text file as the thing you are supposed to read first. The
+    list is meant to open with a handful of names, so the seed size is its own setting.
+    """
+    return apply_updates(settings, {"users": max(1, settings.bootstrap_accounts)})
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m console",
                                 description="generator / operational / settings tabs over this repo's CLIs")
@@ -753,6 +780,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="open the page once it is listening")
     a = p.parse_args(argv)
 
+    home = bundle_home()
+    if home is not None and Path.cwd() != home:
+        try:
+            os.chdir(home)
+        except OSError as exc:  # a read-only folder is a real way to install an .exe
+            print(f"cannot work from {home} ({exc}); the fixture would land in {Path.cwd()} instead",
+                  file=sys.stderr)
+            return 2
+        print(f"console   working from the .exe's own folder: {home}", flush=True)
+
     if a.host not in ("127.0.0.1", "localhost", "::1") and not a.allow_nonlocal:
         print(f"refusing to bind {a.host}:{a.port}: the console runs mutating jobs.\n"
               "Pass --allow-nonlocal if this is a network you own.", file=sys.stderr)
@@ -767,10 +804,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if a.bootstrap and not Path(settings.db).exists():
         # Double-clicking the tool should leave you with accounts to look at, not a form.
-        n = max(1, settings.bootstrap_accounts)
+        setup = bootstrap_settings(settings)
+        n = setup.users
         print(f"first run  generating {n} account(s) into {settings.db} "
-              f"(append mode keeps them from now on)", flush=True)
-        setup = settings if settings.users >= n else Settings(**{**settings.to_json_dict(), "users": n})
+              f"(Settings > bootstrap_accounts; the Generator tab's own {settings.users} is for "
+              f"a deliberate run)", flush=True)
         code = ops.job_generate(setup)(ops.Job(id=0, kind="bootstrap"))
         if code.get("__code__"):
             print(f"refusing to serve: the generator exited {code.get('__code__')}: "
