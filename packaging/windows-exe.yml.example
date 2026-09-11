@@ -1,0 +1,59 @@
+# Copy this file to .github/workflows/windows-exe.yml to have GitHub build the Windows binary.
+#
+# Why it is a copy step and not already in .github/: committing a workflow needs the `workflows`
+# permission on the pushing credential, which the agent that wrote this repo did not have. The
+# build itself lives in packaging/build_exe.ps1 — this file only schedules it — so the CI recipe
+# cannot drift from the one you run locally.
+name: windows-exe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "console/**"
+      - "seeds/**"
+      - "load/**"
+      - "mockapi/**"
+      - "abuse/**"
+      - "packaging/**"
+      - ".github/workflows/windows-exe.yml"
+  pull_request:
+    paths:
+      - "console/**"
+      - "seeds/**"
+      - "load/**"
+      - "mockapi/**"
+      - "abuse/**"
+      - "packaging/**"
+      - ".github/workflows/windows-exe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      # Builds dist\SignupFixtureLab.exe, then starts it and requires the first-run experience:
+      # 5 seeded accounts and dist\var\accounts.txt beside the .exe (the folder-anchoring rule,
+      # checked on the only platform where it can actually go wrong).
+      - name: Build and smoke test
+        run: pwsh -NoProfile -File packaging/build_exe.ps1 -SmokeTest
+
+      - name: Upload the executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignupFixtureLab-windows
+          path: dist/SignupFixtureLab.exe
+          if-no-files-found: error

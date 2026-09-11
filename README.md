@@ -96,14 +96,23 @@ accounts come from Generator Mode, which appends: the new ones are saved alongsi
 with ids that continue, and the list grows by exactly the new accounts. `--bootstrap` never
 touches an existing database — it is a no-op once `var\test.db` exists.
 
-There is a third way to get the binary: the `windows-exe` workflow builds it on a GitHub
-Windows runner and uploads it as a run artifact (and attaches it to the release on a `v*` tag),
-because PyInstaller cannot cross-compile — the `.exe` has to be produced on Windows somewhere.
-The CI job does not stop at "it built": it launches `SignupFixtureLab.exe` from an unrelated
-working directory and requires `/api/state` to report the seeded accounts and
-`dist\var\accounts.txt` to exist beside it, which is the folder-anchoring rule above being
-checked on the only platform where it matters. Expect SmartScreen to warn ("Windows protected
-your PC" → More info → Run anyway): the binary is unsigned, and there is no installer.
+PyInstaller cannot cross-compile, so the `.exe` has to be built on Windows by something.
+`packaging/build_exe.ps1` is that build in scriptable form — same flags as the `.bat`, no
+`pause` at the end, and with `-SmokeTest` it launches `dist\SignupFixtureLab.exe` from an
+unrelated working directory and requires `/api/state` to report the seeded accounts and
+`dist\var\accounts.txt` to exist beside it. That is the folder-anchoring rule above, checked on
+the only platform where it can go wrong, so `build_exe.bat` is not the only thing standing
+between "it built" and "it works".
+
+To have GitHub do it instead, copy `packaging/windows-exe.yml.example` to
+`.github/workflows/windows-exe.yml`: it installs PyInstaller on a `windows-latest` runner, runs
+that same script with `-SmokeTest`, and uploads the binary as a run artifact. It lives in
+`packaging/` rather than `.github/` because committing a workflow needs the `workflows`
+permission on the pushing credential, which the agent that wrote this did not have — the file
+is there to copy, and the `.bat`/`.ps1` it calls are tested here so the two cannot drift.
+
+Expect SmartScreen to warn ("Windows protected your PC" → More info → Run anyway): the binary is
+unsigned, and there is no installer.
 
 `build_exe.bat` is the local version of the same step: it runs PyInstaller and produces
 `dist\SignupFixtureLab.exe`, one file you can copy wherever you work. It has to be run on

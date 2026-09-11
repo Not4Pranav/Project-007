@@ -172,33 +172,51 @@ class ConsistencyTest(unittest.TestCase):
         server = (ROOT / "console" / "server.py").read_text()
         self.assertEqual(server.count("sys.executable"), 1, "only bundle_home() may name the interpreter path")
 
-    def test_the_ci_build_and_the_bat_agree_on_their_flags(self) -> None:
-        """`build_exe.bat` cannot run in CI (it ends in `pause`, which would hang the runner), so
-        `.github/workflows/windows-exe.yml` repeats the PyInstaller command. Two copies of a
-        build command is exactly where a bundle starts missing a data file and fails only on the
-        other machine, so the two are compared here."""
+    def test_the_two_windows_builders_agree(self) -> None:
+        """`build_exe.bat` is the double-click builder and ends in `pause`; `packaging/build_exe.ps1`
+        is the CI-safe one that also boots the result. Two copies of a build command is where a
+        bundle starts missing a data file and fails only on the machine you cannot debug, so the
+        two are compared here — flags, collected packages, bundled data, and what the smoke test
+        actually asserts."""
         bat = (ROOT / "build_exe.bat").read_text(encoding="utf-8", errors="replace")
-        wf_path = ROOT / ".github" / "workflows" / "windows-exe.yml"
-        self.assertTrue(wf_path.is_file(), "the workflow that produces the .exe is gone")
-        wf = wf_path.read_text(encoding="utf-8", errors="replace")
-        block = wf[wf.index("Build SignupFixtureLab.exe"):]
-        block = block[: block.index("- name:")]
+        ps_path = ROOT / "packaging" / "build_exe.ps1"
+        self.assertTrue(ps_path.is_file(), "the PowerShell builder is gone")
+        ps = ps_path.read_text(encoding="utf-8", errors="replace")
 
         def flags(text: str) -> set[str]:
             return set(re.findall(r"--(?:name|onefile|clean|console|windowed|noconsole|add-data"
                                   r"|collect-submodules|hidden-import|paths)", text))
 
-        self.assertEqual(flags(block), flags(bat), "the CI build passes different flags than build_exe.bat")
-        self.assertEqual(set(re.findall(r"--collect-submodules\s+([a-z_]+)", block)),
+        QUOTE = """["']"""
+        self.assertEqual(flags(ps), flags(bat), "the two builders pass different PyInstaller flags")
+        self.assertEqual(set(re.findall(r"--collect-submodules\s+([a-z_]+)", ps)),
                          set(re.findall(r"--collect-submodules\s+([a-z_]+)", bat)),
                          "a package collected in one and not the other is an ImportError on Windows")
-        self.assertEqual(re.findall(r'--add-data "([^"]+)"', block),
-                         re.findall(r'--add-data "([^"]+)"', bat), "the bundled data files must match")
-        self.assertIn("console\__main__.py", block)
-        # the smoke test has to look for the thing the product promises, not just for a port
-        smoke = wf[wf.index("Smoke test the bundle"):]
-        for probe in ("/api/state", r"dist\var\accounts.txt"):
-            self.assertIn(probe, smoke, f"the CI smoke test stopped checking {probe!r}")
+        self.assertEqual(sorted(re.findall(r"--add-data\s+" + QUOTE + r"([^" + QUOTE + r"]+)", ps)),
+                         sorted(re.findall(r"--add-data\s+" + QUOTE + r"([^" + QUOTE + r"]+)", bat)),
+                         "the bundled data files must match")
+        for name, text in (("build_exe.bat", bat), ("packaging/build_exe.ps1", ps)):
+            self.assertIn("console\\__main__.py", text, f"{name} no longer starts the console package")
+            self.assertTrue((ROOT / "console" / "__main__.py").is_file())
+        # the smoke test must check what the product promises, not just that a port answered
+        for probe in ("/api/state", "accounts.txt", "bootstrap_accounts"):
+            self.assertIn(probe, ps, f"the smoke test stopped checking {probe!r}")
+        # a *call* to pause, not the word: the header comment explains why the .bat has one
+        waits = [ln.strip() for ln in ps.splitlines() if ln.strip() in {"pause", "Read-Host"}
+                 or ln.strip().startswith(("pause ", "Read-Host "))]
+        self.assertEqual(waits, [], f"the CI builder would hang the runner on {waits}")
+        self.assertIn("pause", bat, "the double-click builder should still hold its window open")
+        self.assertIn("-SmokeTest", ps, "the smoke test should be opt-in, so a build alone still works")
+
+        # the workflow people copy into .github/ must call that script, not re-implement it
+        ex = (ROOT / "packaging" / "windows-exe.yml.example").read_text(encoding="utf-8")
+        self.assertIn("packaging/build_exe.ps1 -SmokeTest", ex,
+                      "the example workflow no longer runs the same builder")
+        self.assertIn("runs-on: windows-latest", ex,
+                      "PyInstaller cannot cross-compile: a Linux runner cannot build this")
+        self.assertNotIn("build_exe.bat", ex.split("steps:")[1],
+                         "the workflow must not call the .bat: it ends in pause and would hang the runner")
+        self.assertIn("actions/upload-artifact", ex, "an .exe nobody can download is not a build")
 
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real
