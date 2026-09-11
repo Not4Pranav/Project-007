@@ -12,7 +12,7 @@ you own.
 
 ```
 make smoke     # 4k accounts, a scan, and a short load ramp, ~40s
-make test      # 201 tests, no install step
+make test      # 202 tests, no install step
 make console   # the same pipeline behind three tabs: Generator / Operational / Settings
 make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 ```
@@ -106,10 +106,13 @@ between "it built" and "it works".
 
 To have GitHub do it instead, copy `packaging/windows-exe.yml.example` to
 `.github/workflows/windows-exe.yml`: it installs PyInstaller on a `windows-latest` runner, runs
-that same script with `-SmokeTest`, and uploads the binary as a run artifact. It lives in
-`packaging/` rather than `.github/` because committing a workflow needs the `workflows`
-permission on the pushing credential, which the agent that wrote this did not have — the file
-is there to copy, and the `.bat`/`.ps1` it calls are tested here so the two cannot drift.
+that same script with `-SmokeTest`, and uploads the binary as a run artifact on every push; on a
+`v*` tag it also creates a release and attaches the `.exe` to it, so a published version can be
+handed to someone who has no Python. It lives in `packaging/` rather than `.github/` because
+committing a workflow needs the `workflows` permission on the credential doing the push, which
+this agent does not have — the file is there to copy, and the `.bat`/`.ps1` it calls are pinned by
+`tests/test_lint.py` so the two builders cannot drift and the workflow cannot call a script that
+no longer exists.
 
 Expect SmartScreen to warn ("Windows protected your PC" → More info → Run anyway): the binary is
 unsigned, and there is no installer.
@@ -384,7 +387,7 @@ Not a brag, a workflow demo — both were invisible without running it under loa
 with three tabs. It is not a second engine: every button runs the same module the CLI
 runs, and the Generate tab prints that command before running it — the preview and the
 job are built by the same function, so the preview cannot lie about what will happen.
-The page is 22,628 bytes of inline HTML/CSS/JS (22,597 characters) with no build step
+The page is 22,808 bytes of inline HTML/CSS/JS (22,777 characters) with no build step
 and no asset server.
 
 | tab | what it is for |
@@ -577,7 +580,7 @@ does not exist yet**, then does nothing on every later start. The `db`, `api_por
 knobs belong to the Settings tab, not to the command line — there is deliberately no `--db`
 or base-URL flag to point at somebody else's system.
 
-The suite behind all of this is `tests/test_console.py` (61 tests: the settings rules, the
+The suite behind all of this is `tests/test_console.py` (62 tests: the settings rules, the
 header guard, the file-name rules, the exports, and join/undo against a live fixture) plus
 `tests/test_roster.py` (28 on the list itself: reading a hand-edited file, what a Sync may
 and may not delete, the export shape and its permissions); the routes have 26 in

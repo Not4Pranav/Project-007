@@ -173,12 +173,14 @@ above — a database outside <code>var/</code> is refused too.</p>
    boundary: a link whose host is not the loopback API above is refused before anything is
    looked up, because a room somebody else operates is not what this tool drives. Membership lands in
    <code>memberships</code>, so your own queries, member lists and moderation queue have something
-   to chew on, and <i>Undo</i> is a button over the ids the join reported — not a timer.</p>
+   to chew on, and <i>Undo</i> is a button over the ids the join reported — not a timer. The
+   invite box takes a gated room's <i>own</i> slug, which is the only thing that opens it: an
+   open room wants it left empty, and nothing is fetched from anywhere else.</p>
   <div class=grid>
    <div><label>server: link, slug, name or id</label><input id=join-link type=text
      placeholder="http://127.0.0.1:<port>/servers/&lt;slug&gt; — or just the slug"></div>
    <div><label>or pick one (the box wins)</label><select id=join-server></select></div>
-   <div><label>invite code (private rooms)</label><input id=join-invite type=text placeholder=empty></div>
+   <div><label>invite code (private rooms only)</label><input id=join-invite type=text placeholder=empty></div>
    <div><label>accounts from</label><select id=join-source>
      <option value=roster>the account list (accounts.txt)</option>
      <option value=token-file>a run's token dump</option><option value=fixture-logins>newest fixture logins</option>

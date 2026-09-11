@@ -214,9 +214,16 @@ class ConsistencyTest(unittest.TestCase):
                       "the example workflow no longer runs the same builder")
         self.assertIn("runs-on: windows-latest", ex,
                       "PyInstaller cannot cross-compile: a Linux runner cannot build this")
-        self.assertNotIn("build_exe.bat", ex.split("steps:")[1],
+        # the .bat may be *mentioned* in a comment, but must never be *invoked*: it ends in pause
+        called = [ln for ln in ex.splitlines() if "build_exe.bat" in ln and re.match(r"\s*(run|pwsh|cmd|sh)\b", ln)]
+        self.assertEqual(called, [],
                          "the workflow must not call the .bat: it ends in pause and would hang the runner")
         self.assertIn("actions/upload-artifact", ex, "an .exe nobody can download is not a build")
+        self.assertIn("if-no-files-found: error", ex,
+                      "a green CI run that uploaded nothing is worse than a red one")
+        # README promises the tag flow, so the example has to actually carry it
+        self.assertIn('tags:', ex, "a v* tag is supposed to publish the binary")
+        self.assertIn("softprops/action-gh-release", ex, "the tag trigger has nothing to attach to")
 
     def test_readme_flags_exist_in_cli_help(self) -> None:
         """Docs drift silently. Every `--flag` the README names must be a real

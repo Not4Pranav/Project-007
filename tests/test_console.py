@@ -969,6 +969,27 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(shown & real, real, f"not editable in Settings: {sorted(real - shown)}")
         self.assertEqual(sorted(shown - real), [], f"the page still offers removed settings: {sorted(shown - real)}")
 
+    def test_the_join_tab_words_the_boundary_the_code_enforces(self) -> None:
+        """The page is where a person learns what this tool will and will not do, so its wording
+        is pinned to the behaviour: the room box advertises the link (one is accepted, and the
+        loopback host check is what refuses somebody else's), the invite box is described as this
+        fixture's own gate (the code only ever matches a row's own slug), and there is no
+        auto-leave anywhere -- leaving is a button over the ids a join reported, and a timer
+        would make the page's own sentence a lie."""
+        import inspect
+
+        from console import server as srv
+
+        page = srv.PAGE
+        self.assertIn("<label>server: link, slug, name or id</label>", page)
+        self.assertIn("/servers/&lt;slug&gt;", page, "the room box must show that a link is accepted")
+        self.assertIn("invite code (private rooms only)", page)
+        self.assertIn("only thing that opens it", page, "the page must say what opens a gated room")
+        self.assertIn("not a timer", page)
+        src = inspect.getsource(srv)
+        for forbidden in ("auto_leave", "auto-leave", "leave_after", "ttl_seconds"):
+            self.assertNotIn(forbidden, src, f"{forbidden} would make the page's 'not a timer' false")
+
     def test_write_mode_picks_the_seeder_flag(self) -> None:
         append = Settings(write_mode="append").base_argv()
         replace = Settings(write_mode="replace").base_argv()

@@ -1,9 +1,14 @@
 # Copy this file to .github/workflows/windows-exe.yml to have GitHub build the Windows binary.
 #
 # Why it is a copy step and not already in .github/: committing a workflow needs the `workflows`
-# permission on the pushing credential, which the agent that wrote this repo did not have. The
-# build itself lives in packaging/build_exe.ps1 — this file only schedules it — so the CI recipe
-# cannot drift from the one you run locally.
+# permission on the credential doing the push, which this agent does not have. The build itself
+# lives in packaging/build_exe.ps1 -- this file only schedules it -- so the CI recipe cannot
+# drift from the one you run locally.
+#
+# What you get: on a push that touches the runtime packages, a build plus smoke test and the .exe
+# as a downloadable run artifact (that is what you use day to day, and the only copy that exists
+# unless you tag). On a `v*` tag the same artifact is also attached to a GitHub release, which is
+# the form you hand to someone with no Python on their machine.
 name: windows-exe
 
 on:
@@ -11,6 +16,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - "v*"
     paths:
       - "console/**"
       - "seeds/**"
@@ -35,6 +42,8 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,8 +55,9 @@ jobs:
         run: python -m pip install --upgrade pip pyinstaller
 
       # Builds dist\SignupFixtureLab.exe, then starts it and requires the first-run experience:
-      # 5 seeded accounts and dist\var\accounts.txt beside the .exe (the folder-anchoring rule,
-      # checked on the only platform where it can actually go wrong).
+      # the seeded accounts and dist\var\accounts.txt beside the .exe (the folder-anchoring rule,
+      # checked on the only platform where it can actually go wrong). The script exits, which is
+      # the one thing build_exe.bat cannot do: it ends in `pause` for a human at a console.
       - name: Build and smoke test
         run: pwsh -NoProfile -File packaging/build_exe.ps1 -SmokeTest
 
@@ -57,3 +67,32 @@ jobs:
           name: SignupFixtureLab-windows
           path: dist/SignupFixtureLab.exe
           if-no-files-found: error
+
+      - name: Tag for a release
+        id: tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+  # Optional: only runs on a v* tag. Attaching the .exe to a release is the difference between
+  # "an artifact that expires" and "something a Windows user can download and run".
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SignupFixtureLab-windows
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.version }}
+          files: SignupFixtureLab.exe
+          body: >
+            Signed-off build of the fixture console for Windows, produced by PyInstaller on
+            windows-latest. Unsigned: SmartScreen will warn ("Windows protected your PC" ->
+            More info -> Run anyway). It seeds its own accounts on first run and writes
+            var/accounts.txt next to the .exe. There is no installer, and no account in this
+            file can log in to anything other than the mock API in this repository.
