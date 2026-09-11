@@ -274,6 +274,10 @@ class GenericScenario:
                 value = dig(resp.data, dotted)
                 if value is not None:
                     ctx[var] = value
+                    if var == "token":
+                        # provenance for the account dump: a --token-file worker that then
+                        # logged in is browsing *its own* session, not the pre-minted one
+                        ctx["token_source"] = f"{op.name} capture"
         return kind, ms, op.name
 
 

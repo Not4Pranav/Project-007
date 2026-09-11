@@ -25,6 +25,7 @@ make export    # var/out: csv+jsonl + import.postgres.sql for a 30k-account run
 | `mockapi/` | a throwaway register/login/feed app so the harness has an honest target |
 | `load/` | concurrency-ramped load engine, scenario library (built-in or JSON `--spec`), SLO gate, reports |
 | `seeds/export.py` | bulk CSV/JSONL artifacts + a generated Postgres loader, for staging and pytest |
+| `load/accounts.py` | per-worker account dump (identity + bearer token) so a run leaves browsable accounts behind |
 | `docs/recipes.md` | the wiring: Postgres import, pytest fixtures from JSONL, CI gate, spec-driven load |
 | `tests/` | the suite (`unittest`, no pytest needed) |
 | `var/` | generated databases and reports (gitignored) |
@@ -37,6 +38,13 @@ third-party platform, defeating its CAPTCHA, email-verification and per-IP
 limits, which is a ToS violation on that platform and the substrate for raiding,
 scam servers and engagement fraud. Nothing in this repo ports that, and it is not
 what the tooling below is for — every fixture here lands in a SQLite file you own.
+
+That includes the adjacent shapes: no driving accounts into a server via an invite link
+someone else controls, and no join-then-leave-on-a-timer scheduling (it exists to move a
+crowd through a room before moderation lands). The `--accounts-file` dump below is the
+inverse of a `login.txt` credential file — identity plus a revocable session on *your*
+target, never a password, and refuses to write anything for a host that is not local or
+reserved.
 
 ## 60-second tour
 
@@ -183,6 +191,20 @@ from pooled samples, never by averaging stage percentiles.
   so per-IP limits see many clients instead of one monster.
 - **`--slo "p95_ms=250,error_rate_pct=0.5,min_rps=200"`** — exit code 4 on breach,
   which is the whole point: it is a CI gate, not just a console table.
+- **`--token-file var/tokens.txt`** — workers start with a pre-minted session instead of
+  logging in, so authed reads are measured past the login rate limiter. This is not a
+  convenience: a spec run at 25 connections spent its time on 429'd logins and reported
+  `me: skipped 330` instead of authed latency. A dump from a previous run is a valid pool.
+- **`--accounts-file auto`** — writes each worker's identity and bearer token to
+  `var/reports/accounts-<stamp>.{txt,md,revoke.sql}` (0600, gitignored dir) so you can open
+  one in a browser and see what the run actually did. Tokens only: passwords are never
+  written, and nothing is written for a non-local target unless you pass
+  `--allow-remote-tokens`. `python3 -m load.accounts --revoke <file> --db <db>` kills every
+  token in it as a unit — the mock API honours `sessions.revoked`, so a revoked session
+  401s immediately.
+- **https targets are verified by default**; `--insecure` exists for a self-signed staging
+  box and prints a warning when used, because a load harness that silently stops checking
+  certificates is how a test run ends up talking to the wrong host.
 - Scenarios: `feed`, `login`, `register`/`signup`, `post`, and `mixed` with
   `--mix register=4,login=40,feed=45,post=11`. Outcomes are separated into
   `ok / throttled / conflict / auth_fail / client_error / server_error / transport`,

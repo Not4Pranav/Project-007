@@ -37,7 +37,7 @@ def ruff_command() -> list[str] | None:
 # has to be listed here, which is the point: the two tests below then check its help
 # output and every flag the README promises for it.
 CLI_MODULES = ("seeds.seed", "seeds.report_cli", "seeds.export", "abuse.detector",
-               "mockapi.server", "load.engine")
+               "mockapi.server", "load.engine", "load.accounts")
 
 
 @unittest.skipUnless(ruff_command(), "ruff not installed (`pip install ruff` enables this)")
@@ -73,6 +73,22 @@ class HygieneTest(unittest.TestCase):
 
 
 class ConsistencyTest(unittest.TestCase):
+    def test_make_targets_actually_run(self) -> None:
+        """`make load` was a silent no-op for as long as the `load/` package existed:
+        make found a *directory* named `load`, considered the target up to date, and
+        printed nothing. Every documented target must therefore be .PHONY."""
+        makefile = (ROOT / "Makefile").read_text()
+        targets = sorted(set(re.findall(r"^([a-z][a-z-]*):.*?## ", makefile, re.M)))
+        self.assertGreater(len(targets), 6, "help stopped documenting targets?")
+        phony = set()
+        for line in makefile.splitlines():
+            if line.startswith(".PHONY:"):
+                phony.update(line.split(":", 1)[1].split())
+        shadowed = [t_ for t_ in targets if t_ not in phony and (ROOT / t_).exists()]
+        self.assertEqual(shadowed, [], f"targets shadowed by a path of the same name: {shadowed}")
+        self.assertTrue(set(targets) <= phony, f"not .PHONY: {set(targets) - phony}")
+
+
     def test_schema_columns_cover_what_the_seeder_writes(self) -> None:
         """The seeder once gained a column in USER_COLS without a matching
         `users` column (and vice versa) and only blew up at the first INSERT."""

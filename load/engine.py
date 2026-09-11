@@ -169,6 +169,34 @@ def parse_stages(spec: str) -> list[tuple[int, float]]:
     return out or [(10, 0.0)]
 
 
+def write_account_dump(a, scenario, ledgers: list[tuple[str, list[dict]]], from_spec: bool,
+                       report_path: Path) -> list[Path]:
+    """Render the worker ledger into txt/md/revoke.sql, or refuse loudly.
+
+    Refusing is the point: a dump of real users' sessions on a production host is not
+    something a flag typo should produce, so the default only allows local/reserved
+    targets, and an empty ledger is reported as the auth failure it is.
+    """
+    from .accounts import collect, local_target, write_artifacts
+
+    rows, workers_seen, no_token = collect(ledgers, source="spec capture" if from_spec else scenario.name)
+    if not local_target(a.base_url) and not a.allow_remote_tokens:
+        print("\naccounts     NOT written: the target is not local/reserved. Pass "
+              "--allow-remote-tokens only for a host whose accounts you own.", file=sys.stderr)
+        return []
+    if not rows:
+        print("\naccounts     nothing to write: no worker ended with a token "
+              "(login throttled, or `capture` never matched)", file=sys.stderr)
+        return []
+    stem = (Path(a.out) / f"accounts-{report_path.stem.removeprefix('load-')}") if a.accounts_file == "auto" \
+        else Path(a.accounts_file)
+    stem = stem.with_suffix("") if stem.suffix else stem
+    meta = {"base_url": a.base_url, "scenario": scenario.name, "stages": a.stages, "seed": a.seed,
+            "workers": workers_seen, "without_token": no_token,
+            "db": str(a.fixture_db) if a.fixture_db else "", "fixture_hash": _fixture_hash(a.fixture_db)}
+    return write_artifacts(stem, rows, meta=meta)
+
+
 def parse_slo(spec: str) -> dict[str, float]:
     out: dict[str, float] = {}
     for chunk in filter(None, spec.replace(" ", "").split(",")):
@@ -193,6 +221,21 @@ def check_slo(stats: Stats, slo: dict[str, float]) -> list[str]:
     return breaches
 
 
+def _fixture_hash(db: str | None) -> str:
+    """The seed's identity, so a token file can be tied to the fixture that minted it."""
+    if not db:
+        return ""
+    try:
+        conn = sqlite3.connect(f"file:{Path(db).expanduser().resolve()}?mode=ro", uri=True, timeout=10)
+        try:
+            row = conn.execute("SELECT value FROM meta WHERE key='fixture_hash'").fetchone()
+            return str(row[0]) if row else ""
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return ""
+
+
 def identifier_pool(args) -> tuple[list[str], str]:
     """Where the login path gets accounts: read the fixture DB directly, or ask
     the target for a sample if it exposes that endpoint."""
@@ -213,7 +256,9 @@ def identifier_pool(args) -> tuple[list[str], str]:
 
 
 def run_stage(client: ApiClient, scenario, opts: LoadOptions, *, concurrency: int, seconds: float,
-              rps: float, think_ms: float, seed: int, label: str) -> tuple[Stats, Recorder]:
+              rps: float, think_ms: float, seed: int, label: str,
+              ledger: list[dict] | None = None,
+              token_pool: list[tuple[str, str]] | None = None) -> tuple[Stats, Recorder]:
     """`rps` is the total for the stage; each worker paces to its share.
 
     0 keeps it closed-loop. A saturated closed-loop run reports throughput your
@@ -227,6 +272,19 @@ def run_stage(client: ApiClient, scenario, opts: LoadOptions, *, concurrency: in
 
     def worker(idx: int) -> None:
         ctx: dict = {"rnd": random.Random(seed * 1_000_003 + idx)}
+        if token_pool:
+            # Pre-minted state, i.e. a session that already exists on the target. This is
+            # how you measure authed reads past a login limiter, and it is why `requires`
+            # must stay enforced: the op is legitimate here, not skipped.
+            ident, token = token_pool[idx % len(token_pool)]
+            ctx["token"] = token
+            ctx["token_source"] = "token-file"
+            if ident:
+                ctx["last_ident"] = ident
+        if ledger is not None:
+            # the dict itself, so whatever the scenario stores later (a captured token,
+            # the identity it used) is what the account dump reads after the join
+            ledger.append(ctx)
         next_due = time.monotonic()
         try:
             barrier.wait(timeout=60)
@@ -350,6 +408,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--slo", default="", help="e.g. p95_ms=250,error_rate_pct=0.5,min_rps=150")
     p.add_argument("--slo-scope", choices=["final", "overall"], default="final")
     p.add_argument("--out", default="var/reports")
+    p.add_argument("--accounts-file", default="none", metavar="PATH|auto",
+                   help="dump each worker's identity + bearer token (txt, md, revoke.sql); "
+                        "'auto' writes under --out; tokens only, never passwords")
+    p.add_argument("--token-file", default="", metavar="PATH",
+                   help="pre-minted 'identity<TAB>token' lines to hand workers, so authed "
+                        "ops run without the login path's rate limiter in the way")
+    p.add_argument("--insecure", action="store_true",
+                   help="skip TLS certificate verification (self-signed staging boxes only)")
+    p.add_argument("--allow-remote-tokens", action="store_true",
+                   help="permit an account dump when the target is not local/reserved")
     p.add_argument("--count-throttled-as-error", action="store_true")
     a = p.parse_args(argv)
 
@@ -358,7 +426,10 @@ def main(argv: list[str] | None = None) -> int:
               "reach a real mailbox", file=sys.stderr)
         return 5
 
-    client = ApiClient(a.base_url, ip_pool=a.ip_pool)
+    client = ApiClient(a.base_url, ip_pool=a.ip_pool, verify_tls=not a.insecure)
+    if a.insecure:
+        print("tls          verification DISABLED (--insecure): self-signed staging only",
+              file=sys.stderr)
     health = client.health()
     if not health.ok:
         print(f"target unreachable at {a.base_url}: status={health.status} {health.data}", file=sys.stderr)
@@ -415,18 +486,35 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * len(head))
 
     stage_stats: list[Stats] = []
+    ledgers: list[tuple[str, list[dict]]] = []
+    token_pool: list[tuple[str, str]] = []
+    if a.token_file:
+        from .accounts import parse_file
+
+        token_pool = parse_file(a.token_file)
+        if not token_pool:
+            print(f"--token-file {a.token_file}: no usable lines "
+                  "(expected 'identity<TAB>token', or a bare token per line)", file=sys.stderr)
+            return 2
+        print(f"tokens      {len(token_pool)} pre-minted session(s) from {a.token_file}, "
+              f"assigned round-robin per worker (authed ops skip the login path)")
+
     pooled = Recorder()
     for i, (conc, secs_override) in enumerate(stages, 1):
         label = f"s{i}"
         seconds = secs_override or a.stage_seconds
         if a.warmup_seconds > 0:
             run_stage(client, scenario, opts, concurrency=conc, seconds=a.warmup_seconds,
+                     token_pool=token_pool,
                       rps=(a.rps / max(1, len(stages))) if a.rps else 0.0, think_ms=a.think_ms,
                       seed=a.seed + 100 * i, label=f"{label}w")
+        stage_ledger: list[dict] = []
         stats, rec = run_stage(client, scenario, opts, concurrency=conc, seconds=seconds,
+                               ledger=stage_ledger, token_pool=token_pool,
                                rps=(a.rps / max(1, len(stages))) if a.rps else 0.0, think_ms=a.think_ms,
                                seed=a.seed + 100 * i, label=label)
         stage_stats.append(stats)
+        ledgers.append((label, stage_ledger))
         pooled.merge(rec)
         print(f"{label:>8} {conc:>5} {stats.ops:>9,} {stats.rps:>7.0f} {stats.mean:>7.1f} {stats.p50:>7.1f} "
               f"{stats.p95:>8.1f} {stats.p99:>9.1f} {stats.max:>9.1f} {stats.errors:>6.2f} {stats.throttled:>6.2f}")
@@ -467,6 +555,10 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"report      {mp}")
     print(f"raw         {jp}")
+    if a.accounts_file != "none":
+        paths = write_account_dump(a, scenario, ledgers, spec is not None, mp)
+        for path in paths:
+            print(f"accounts    {path}")
     if slo:
         print(f"slo         {a.slo_scope}: {'PASS' if not breaches else 'FAIL -> ' + '; '.join(breaches)}")
     if spec_errors:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import ssl
 import time
 from contextlib import suppress
 from dataclasses import dataclass
-from http.client import HTTPConnection
+from http.client import HTTPConnection, HTTPSConnection
 from itertools import count
 from threading import Lock, local
 from typing import Any
@@ -40,8 +41,12 @@ class ApiClient:
     """
 
     def __init__(self, base_url: str, *, timeout: float = 10.0, user_agent: str = "fixture-load/1.0",
-                 ip_pool: int = 0) -> None:
-        """`ip_pool` > 0 stamps each worker thread with its own X-Forwarded-For.
+                 ip_pool: int = 0, verify_tls: bool = True) -> None:
+        """TLS is supported and verified by default, because a staging target over
+        `https://` is the normal case for `--spec` runs. `verify_tls=False` exists for
+        a self-signed dev box and must be reached by an explicit flag, never a default.
+
+        `ip_pool` > 0 stamps each worker thread with its own X-Forwarded-For.
 
         Without it, 250 concurrent workers look like one abusive client and every
         per-IP limit you have fires at 1/250th of the traffic. Addresses come from
@@ -49,10 +54,19 @@ class ApiClient:
         toward a real host.
         """
         u = urlsplit(base_url)
-        if u.scheme not in ("http", ""):
-            raise ValueError(f"only http supported (this is a test target), got {u.scheme!r}")
+        if u.scheme not in ("http", "https", ""):
+            raise ValueError(f"expected http(s), got {u.scheme!r}")
+        self.tls = u.scheme == "https"
+        if self.tls and not verify_tls:
+            # Ruff's `S` rules are not enabled here, and verification is opt-out by an
+            # explicit flag, so this is deliberate rather than suppressed.
+            self._ssl = ssl._create_unverified_context()
+        elif self.tls:
+            self._ssl = ssl.create_default_context()
+        else:
+            self._ssl = None
         self.host = u.hostname or "127.0.0.1"
-        self.port = u.port or 80
+        self.port = u.port or (443 if self.tls else 80)
         self.timeout = timeout
         self.user_agent = user_agent
         self.ip_pool = max(0, ip_pool)
@@ -64,7 +78,10 @@ class ApiClient:
     def _conn(self) -> HTTPConnection:
         conn = getattr(self._local, "conn", None)
         if conn is None:
-            conn = HTTPConnection(self.host, self.port, timeout=self.timeout)
+            if self.tls:
+                conn = HTTPSConnection(self.host, self.port, timeout=self.timeout, context=self._ssl)
+            else:
+                conn = HTTPConnection(self.host, self.port, timeout=self.timeout)
             conn.sock = None
             self._local.conn = conn
         return conn

@@ -291,7 +291,79 @@ Notes from hard experience, all of which the harness already encodes:
 
 ---
 
-## 5. Scaling and limits
+## 5. Browse as one of the accounts the run used
+
+A load run normally leaves percentiles and nothing else. `--accounts-file` also
+leaves the *identities*: one row per worker, with the bearer token that worker was
+using when the stage ended.
+
+```bash
+python3 -m load.engine --base-url http://127.0.0.1:8000 --fixture-db var/test.db \
+  --stages 25:15 --scenario mixed --accounts-file auto
+# accounts    var/reports/accounts-20260911-051253.txt
+# accounts    var/reports/accounts-20260911-051253.md
+# accounts    var/reports/accounts-20260911-051253.revoke.sql
+```
+
+```
+alina59@aol.com         ses_srPCEdLCbuHkDqjq-S2NNELu      # identity<TAB>token, 0600
+```
+
+Then be that user, without logging in again:
+
+```bash
+curl -H "Authorization: Bearer ses_srPCEdLCbuHkDqjq-S2NNELu" \
+  http://127.0.0.1:8000/users/me
+# {"id": 6589, "username": "enzo.rossi37", "event_count": 24, "verified_ts": ...}
+```
+
+Or paste the token into your app's session store and click through the UI — this is the
+fastest way to see what a benchmark *wrote*, which no latency table will tell you.
+
+Three properties of the artifact, all deliberate:
+
+- **Tokens, never passwords.** `email + bearer` is a session you can revoke in one
+  statement; `email:password:token` is a credential file, and it is the shape that ends up
+  committed. The `.md` names the fixture password only as prose pointing at `--test-password`.
+- **Scoped to what the run touched.** Rows come from the worker ledger (the per-worker
+  `ctx` the engine already owns), so a 250-connection run yields ~250 rows, not 30k.
+  `--accounts-file PATH` overrides the location; anything outside `var/` needs
+  `--allow-remote-tokens` as well as your own judgement, and a non-local host needs that
+  flag regardless — a dump of a production host's sessions is not a test artifact.
+- **Revocable as a unit.** `revoke.sql` sits next to it, and the CLI does the same thing
+  with a count:
+
+  ```bash
+  python3 -m load.accounts --revoke var/reports/accounts-*.txt --db var/test.db --dry-run
+  # 5 tokens listed, 5 currently live in var/test.db
+  python3 -m load.accounts --revoke var/reports/accounts-20260911-051253.txt --db var/test.db
+  # revoked 5 live session(s) from accounts-20260911-051253.txt; 0 left active
+  ```
+
+  Verified against the mock API: the same token returns 200 before and 401 after.
+
+  Add `--delete` to remove the dump and its `.md`/`.revoke.sql` siblings with it, and prefer
+  that over leaving them in `var/`: revocation is only durable while the `sessions` rows
+  are, and seeded tokens are deterministic in `--seed` — re-seed the fixture and every token
+  in a stale dump is minted again, live, with the same string. Deleting the file is the part
+  an `UPDATE` cannot undo.
+
+If the `.md` says `N never authenticated`, that is a finding about the run, not the writer:
+login was throttled, or a spec's `capture` never matched, so every authed op was counted
+`skipped`. Fix that before reading the percentiles.
+
+Reusing the dump as input (skip the login limiter entirely on the next run):
+
+```bash
+python3 -m load.engine --base-url http://127.0.0.1:8000 --token-file \
+  var/reports/accounts-20260911-051253.txt --stages 25:15
+```
+
+`--token-file` hands each worker a pre-minted bearer in rotation, so authed reads are
+measured without the login path's rate limiter in the way — the thing that made an earlier
+run report `me: skipped 330` instead of usable authed latency.
+
+## 6. Scaling and limits
 
 Verified shapes for the modules added here (`--users 100000` into SQLite, 2 CPU cores):
 

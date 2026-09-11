@@ -15,6 +15,11 @@ W ?= -W ignore::ResourceWarning   # the throwaway server's daemon threads leak s
 
 .DEFAULT_GOAL := help
 
+# Without this, `make load`/`make test`/`make report` silently do nothing: a directory
+# named `load/`, `tests/` or `seeds/report*` exists, so make considers the target
+# up to date. Targets that are not files must say so.
+.PHONY: help seed report detect api load load-spec export revoke smoke demo test lint clean
+
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo
@@ -37,7 +42,13 @@ api: ## run the mock app (register/login/feed) on $(PORT) for the load engine
 
 load: ## ramped load run against the mock app, with an SLO exit code
 	$(PY) $(W) -m load.engine --fixture-db $(DB) --stages $(STAGES) --stage-seconds 15 \
-	  --base-url http://127.0.0.1:$(PORT) --slo "$(SLO)"
+	  --base-url http://127.0.0.1:$(PORT) --slo "$(SLO)" --accounts-file auto
+	@echo "  browse as a worker: see var/reports/accounts-*.md   undo: make revoke"
+
+revoke: ## kill every session token in the newest account dump
+	@latest=$$(ls -t var/reports/accounts-*.txt 2>/dev/null | head -1); \
+	 if [ -z "$$latest" ]; then echo "no dump in var/reports (run: make load)"; exit 1; fi; \
+	 echo "revoking $$latest"; $(PY) -m load.accounts --revoke "$$latest" --db $(DB)
 
 smoke: ## fast path: 4k accounts, 3 short stages, ~40s total
 	$(PY) $(W) -m seeds.seed --db var/smoke.db --users 4000 --days 30 --inject-bots 200 --fresh
