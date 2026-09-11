@@ -745,7 +745,8 @@ def main(argv: list[str] | None = None) -> int:
     if a.bootstrap and not Path(settings.db).exists():
         # Double-clicking the tool should leave you with accounts to look at, not a form.
         n = max(1, settings.bootstrap_accounts)
-        print(f"first run  generating {n} account(s) into {settings.db} (append mode keeps them from now on)")
+        print(f"first run  generating {n} account(s) into {settings.db} "
+              f"(append mode keeps them from now on)", flush=True)
         setup = settings if settings.users >= n else Settings(**{**settings.to_json_dict(), "users": n})
         code = ops.job_generate(setup)(ops.Job(id=0, kind="bootstrap"))
         if code.get("__code__"):
@@ -753,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"{str(code)[:200]}", file=sys.stderr)
             return 2
         roster = ops.job_roster(setup, "seed")(ops.Job(id=0, kind="roster-seed"))
-        print(f"first run  account list: {roster.get('written')} listed -> {setup.account_list}")
+        print(f"first run  account list: {roster.get('written')} listed -> {setup.account_list}", flush=True)
 
     httpd = serve(a.port, a.host, path, verbose=a.verbose, allow_nonlocal=a.allow_nonlocal)
     url = f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '::') else a.host}:{a.port}/"
