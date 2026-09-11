@@ -76,6 +76,31 @@ CREATE TABLE IF NOT EXISTS flags (
     PRIMARY KEY (user_id, rule)
 );
 
+-- --------------------------------------------------------------- servers
+-- Membership is a first-class table so "these 400 test accounts joined that server"
+-- is something the fixture can answer with a query. `left_ts` makes the lifecycle
+-- (join / leave / rejoin) representable; `capacity` exists so the "server full"
+-- rejection path is reachable in a load run instead of theoretical.
+CREATE TABLE IF NOT EXISTS servers (
+    id         INTEGER PRIMARY KEY,
+    name       TEXT    NOT NULL,
+    slug       TEXT    NOT NULL UNIQUE,
+    created_ts INTEGER NOT NULL,
+    owner_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    capacity   INTEGER,
+    private    INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS memberships (
+    server_id  INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    joined_ts  INTEGER NOT NULL,
+    left_ts    INTEGER,
+    role       TEXT    NOT NULL DEFAULT 'member',
+    source     TEXT    NOT NULL DEFAULT 'app',
+    PRIMARY KEY (server_id, user_id)
+);
+
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -98,3 +123,6 @@ CREATE INDEX IF NOT EXISTS idx_events_ts_kind    ON events(ts, kind);
 CREATE INDEX IF NOT EXISTS idx_events_feed        ON events(ts DESC, id DESC) WHERE kind IN ('post','message');
 CREATE INDEX IF NOT EXISTS idx_sessions_user     ON sessions(user_id, last_seen_ts);
 CREATE INDEX IF NOT EXISTS idx_flags_score       ON flags(score);
+-- Live membership list per server, in join order (keyset, like the feed).
+CREATE INDEX IF NOT EXISTS idx_memberships_server ON memberships(server_id, joined_ts, user_id);
+CREATE INDEX IF NOT EXISTS idx_memberships_user   ON memberships(user_id, joined_ts);

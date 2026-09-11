@@ -145,6 +145,54 @@ def build_user_rows(
     return rows, bursts
 
 
+def build_server_rows(rng, rows: list[dict], n: int) -> list[dict]:
+    """A handful of servers to join, sized so membership skew is visible.
+
+    Names come from the same corpus as usernames so they look app-generated, and the
+    owner is always an existing user. One server in six gets a small capacity so the
+    "server full" rejection path is reachable rather than theoretical.
+    """
+    if n <= 0 or not rows:
+        return []
+    out: list[dict] = []
+    slugs: set[str] = set()
+    for _ in range(n * 3):  # oversample, then keep the first N unique slugs
+        if len(out) >= n:
+            break
+        adj = str(rng.pick(corpus.ADJECTIVES)).replace("-", "")
+        noun = str(rng.pick(corpus.NOUNS)).replace("-", "")
+        slug = f"{adj}-{noun}"[:28]
+        if slug in slugs:
+            continue
+        slugs.add(slug)
+        owner = rows[rng.int(0, len(rows) - 1)]
+        out.append({
+            "name": f"{adj.title()} {noun.title()}", "slug": slug, "created_ts": owner["signup_ts"],
+            "owner_id": owner["id"], "capacity": rng.int(3, 40) if rng.chance(1 / 6) else None,
+            "private": 1 if rng.chance(0.15) else 0,
+        })
+    for i, s in enumerate(out, start=1):
+        s["id"] = i
+    return out
+
+
+def insert_servers(conn, servers: list[dict]) -> None:
+    if not servers:
+        return
+    conn.execute("BEGIN")
+    try:
+        conn.executemany(
+            "INSERT OR REPLACE INTO servers (id, name, slug, created_ts, owner_id, capacity, private) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [(s["id"], s["name"], s["slug"], s["created_ts"], s["owner_id"], s["capacity"], s["private"])
+             for s in servers],
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
 def insert_rows(conn, rows: list[dict]) -> None:
     user_sql = f"INSERT INTO users ({', '.join(USER_COLS)}, id) VALUES ({', '.join('?' * (len(USER_COLS) + 1))})"
     for s in range(0, len(rows), BATCH):
@@ -204,6 +252,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--hash-algo", choices=("pbkdf2_sha256", "sha256_fast"), default="pbkdf2_sha256",
                    help="sha256_fast = throwaway speed for 100k+ account runs")
     p.add_argument("--min-password-length", type=int, default=10)
+    p.add_argument("--servers", type=int, default=6,
+                   help="shared servers/join targets to create (0 disables)")
     p.add_argument("--no-activity", action="store_true")
     p.add_argument("--fresh", action="store_true", help="wipe rows first (schema stays)")
     p.add_argument("--quiet", action="store_true")
@@ -237,6 +287,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if rows:
         insert_rows(conn, rows)
+
+    servers = build_server_rows(rng, rows, max(0, a.servers))
+    insert_servers(conn, servers)
 
     n_events = 0
     if not a.no_activity and rows:

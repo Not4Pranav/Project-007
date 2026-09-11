@@ -8,6 +8,7 @@ DAYS    ?= 180
 BOTS    ?= 1200
 SEED    ?= 42
 PORT    ?= 8000
+CPORT   ?= 8010
 STAGES  ?= 25,100,250
 SLO     ?= p95_ms=250,error_rate_pct=0.5
 
@@ -18,13 +19,13 @@ W ?= -W ignore::ResourceWarning   # the throwaway server's daemon threads leak s
 # Without this, `make load`/`make test`/`make report` silently do nothing: a directory
 # named `load/`, `tests/` or `seeds/report*` exists, so make considers the target
 # up to date. Targets that are not files must say so.
-.PHONY: help seed report detect api load load-spec export revoke smoke demo test lint clean
+.PHONY: help seed report detect api load load-spec export revoke smoke demo console test lint clean
 
 help: ## list targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "  vars: DB=$(DB) USERS=$(USERS) DAYS=$(DAYS) BOTS=$(BOTS) STAGES=$(STAGES)"
-	@echo "        SLO='$(SLO)' PORT=$(PORT)   (make seed USERS=200000)"
+	@echo "        SLO='$(SLO)' PORT=$(PORT) CPORT=$(CPORT)   (make seed USERS=200000)"
 
 seed: ## rebuild the fixture database (users, credentials, activity, sessions)
 	$(PY) $(W) -m seeds.seed --db $(DB) --users $(USERS) --days $(DAYS) --seed $(SEED) \
@@ -64,6 +65,11 @@ load-spec: ## drive the API at $(PORT) from a JSON scenario spec instead of buil
 	$(PY) $(W) -m load.engine --base-url http://127.0.0.1:$(PORT) \
 	  --spec docs/examples/mockapi.load.json --fixture-db $(DB) --stages $(STAGES) \
 	  --slo "$(SLO)"
+
+console: ## the three tabs (Generator / Operational / Settings) on http://127.0.0.1:$(CPORT)
+	@echo "seeding var/console.json with DB=$(DB) PORT=$(PORT); the other knobs live in the Settings tab"
+	@$(PY) -c "import sys; sys.path.insert(0,'.'); from pathlib import Path; from console.settings import Settings, apply_updates, load, save; p=Path('var/console.json'); cur=(load(p) if p.exists() else Settings()); save(p, apply_updates(cur, {'db':'$(DB)', 'api_port':'$(PORT)', 'users':'$(USERS)', 'days':'$(DAYS)', 'bots':'$(BOTS)', 'seed':'$(SEED)', 'stages':'$(STAGES)', 'slo':'$(SLO)'}))"
+	$(PY) $(W) -m console --port $(CPORT) --settings var/console.json
 
 demo: seed detect ## seed at full size, then scan it
 

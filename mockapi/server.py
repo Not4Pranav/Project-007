@@ -41,6 +41,7 @@ class Config:
     max_inflight: int = 256
     rate_limit_per_min: int = 300
     login_rate_limit_per_min: int = 600
+    join_rate_limit_per_min: int = 600
     latency_ms: float = 0.0
     block_disposable: bool = False
     min_password_length: int = 10
@@ -205,6 +206,10 @@ class Handler(BaseHTTPRequestHandler):
     def login_bucket(self) -> Bucket:
         return self.server.login_bucket  # type: ignore[attr-defined]
 
+    @property
+    def join_bucket(self) -> Bucket:
+        return self.server.join_bucket  # type: ignore[attr-defined]
+
     def log_message(self, fmt: str, *args) -> None:  # pragma: no cover
         if self.cfg.log:
             super().log_message(fmt, *args)
@@ -305,8 +310,154 @@ class Handler(BaseHTTPRequestHandler):
             # at saturation, so count it once instead of dumping a traceback per abort.
             self.metrics.error("client_aborted")
 
+    def _servers_collection(self, method: str, qs: dict) -> tuple[int, object, dict[str, str]]:
+        """GET /servers — the join targets, with live member counts.
+
+        Sends `joined`/`left` per row when a bearer is present, because the console
+        renders this as the picker and needs to show which of *its* accounts are in.
+        """
+        c = self.store.conn
+        limit = min(200, max(1, int((qs.get("limit") or ["50"])[0])))
+        rows = c.execute(
+            "SELECT s.id, s.name, s.slug, s.capacity, s.private, s.created_ts, s.owner_id, "
+            "       (SELECT COUNT(*) FROM memberships m WHERE m.server_id = s.id AND m.left_ts IS NULL) "
+            "         AS members "
+            "FROM servers s ORDER BY s.id LIMIT ?", (limit,),
+        ).fetchall()
+        out = [dict(r) for r in rows]
+        for row in out:
+            if row["private"]:
+                # In this fixture the slug *is* the invite code, and a list endpoint that
+                # hands it out would turn the private-server path into a formality. The row
+                # belongs to a database the operator is holding: read it there.
+                row["slug"] = None
+        u = self._user_from_token()
+        if u is not None:
+            mine = {r["server_id"]: r for r in c.execute(
+                "SELECT server_id, joined_ts, left_ts, role FROM memberships WHERE user_id = ?",
+                (u["id"],)).fetchall()}
+            for row in out:
+                m = mine.get(row["id"])
+                row["membership"] = None if m is None else {
+                    "joined_ts": m["joined_ts"], "left_ts": m["left_ts"], "role": m["role"],
+                    "state": "left" if m["left_ts"] else "joined"}
+        return 200, {"servers": out, "as_user": None if u is None else u["id"]}, {}
+
+    def _server_join(self, sid: int) -> tuple[int, object, dict[str, str]]:
+        c = self.store.conn
+        ok, wait = self.join_bucket.allow(self._client_ip())
+        if not ok:
+            return 429, {"error": "rate limit exceeded", "retry_after_s": round(wait, 2)}, {
+                "Retry-After": str(max(1, int(wait))), "X-RateLimit-Remaining": "0"}
+        u = self._user_from_token()
+        if u is None:
+            return 401, {"error": "join requires a bearer token"}, {}
+        try:
+            body = self._json_body()
+        except ValueError as exc:
+            return 400, {"error": str(exc)}, {}
+        srv = c.execute("SELECT id, name, slug, capacity, private FROM servers WHERE id = ?",
+                        (sid,)).fetchone()
+        if srv is None:
+            return 404, {"error": "no such server"}, {}
+        if srv["private"] and str(body.get("invite") or "") != srv["slug"]:
+            return 403, {"error": "private server; `invite` must equal the slug"}, {}
+        now = int(time.time())
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = c.execute("SELECT joined_ts, left_ts FROM memberships WHERE server_id=? AND user_id=?",
+                            (sid, u["id"])).fetchone()
+            if cur is not None and cur["left_ts"] is None:
+                c.execute("COMMIT")
+                return 409, {"error": "already a member", "joined_ts": cur["joined_ts"]}, {}
+            if srv["capacity"] is not None:
+                live = c.execute("SELECT COUNT(*) n FROM memberships WHERE server_id=? AND left_ts IS NULL",
+                                 (sid,)).fetchone()["n"]
+                if live >= srv["capacity"]:
+                    c.execute("COMMIT")
+                    return 403, {"error": "server is at capacity", "capacity": srv["capacity"]}, {}
+            if cur is not None:
+                # rejoin: keep the row, reopen it. A fresh membership row per cycle would
+                # make "who has ever joined" unanswerable.
+                c.execute("UPDATE memberships SET joined_ts=?, left_ts=NULL, role='member', source='api' "
+                          "WHERE server_id=? AND user_id=?", (now, sid, u["id"]))
+                status, verb = 200, "rejoined"
+            else:
+                c.execute("INSERT INTO memberships (server_id, user_id, joined_ts, role, source) "
+                          "VALUES (?,?,?,'member','api')", (sid, u["id"], now))
+                status, verb = 201, "joined"
+            members = c.execute("SELECT COUNT(*) n FROM memberships WHERE server_id=? AND left_ts IS NULL",
+                               (sid,)).fetchone()["n"]
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        return status, {"server_id": sid, "user_id": u["id"], "state": verb, "joined_ts": now,
+                        "members": members, "capacity": srv["capacity"]}, {}
+
+    def _server_leave(self, sid: int) -> tuple[int, object, dict[str, str]]:
+        c = self.store.conn
+        u = self._user_from_token()
+        if u is None:
+            return 401, {"error": "leave requires a bearer token"}, {}
+        now = int(time.time())
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            cur = c.execute("SELECT joined_ts, left_ts FROM memberships WHERE server_id=? AND user_id=?",
+                            (sid, u["id"])).fetchone()
+            if cur is None or cur["left_ts"] is not None:
+                c.execute("COMMIT")
+                return 409, {"error": "not a current member of that server"}, {}
+            c.execute("UPDATE memberships SET left_ts=? WHERE server_id=? AND user_id=?",
+                      (now, sid, u["id"]))
+            held = now - cur["joined_ts"]
+            c.execute("COMMIT")
+        except Exception:
+            c.execute("ROLLBACK")
+            raise
+        return 200, {"server_id": sid, "user_id": u["id"], "state": "left", "left_ts": now,
+                     "held_seconds": held}, {}
+
+    def _server_members(self, method: str, sid: int, qs: dict) -> tuple[int, object, dict[str, str]]:
+        if method != "GET":
+            return 405, {"error": "members is read-only; use /servers/<id>/leave"}, {}
+        c = self.store.conn
+        if c.execute("SELECT 1 FROM servers WHERE id=?", (sid,)).fetchone() is None:
+            return 404, {"error": "no such server"}, {}
+        limit = min(200, max(1, int((qs.get("limit") or ["25"])[0])))
+        cursor = (qs.get("cursor") or [""])[0]
+        args: list[object] = [sid]
+        sql = ("SELECT m.user_id, u.username, u.status, m.joined_ts, m.role FROM memberships m "
+               "JOIN users u ON u.id = m.user_id "
+               "WHERE m.server_id = ? AND m.left_ts IS NULL")
+        if cursor:
+            head, _, tail = cursor.partition(":")
+            if not head.isdigit() or not tail.isdigit():
+                return 400, {"error": "cursor must be ts:id"}, {}
+            sql += " AND (m.joined_ts, m.user_id) < (?, ?)"
+            args += [int(head), int(tail)]
+        rows = c.execute(sql + " ORDER BY m.joined_ts DESC, m.user_id DESC LIMIT ?", (*args, limit + 1)).fetchall()
+        page = rows[:limit]
+        nxt = f"{page[-1]['joined_ts']}:{page[-1]['user_id']}" if len(page) == limit else None
+        return 200, {"server_id": sid, "members": [dict(r) for r in page],
+                     "next_cursor": nxt}, {}
+
     def _route(self, method: str, route: str, qs: dict) -> tuple[int, object, dict[str, str]]:
         c = self.store.conn
+        if route == "/servers":
+            return self._servers_collection(method, qs)
+        if route.startswith("/servers/"):
+            head, _, tail = route[len("/servers/"):].partition("/")
+            if not head.isdigit():
+                return 404, {"error": "server id must be numeric"}, {}
+            sid = int(head)
+            if tail == "join":
+                return self._server_join(sid)
+            if tail == "leave":
+                return self._server_leave(sid)
+            if tail.startswith("members"):
+                return self._server_members(method, sid, qs)
+            return 404, {"error": "unknown server route", "try": "/servers/<id>/join|leave|members"}, {}
         if route == "/":
             return 200, INDEX_HTML, {}
         if route == "/healthz":
@@ -569,6 +720,7 @@ def build_server(cfg: Config) -> AdmissionServer:
     httpd.metrics = Metrics()  # type: ignore[attr-defined]
     httpd.reg_bucket = Bucket(cfg.rate_limit_per_min)  # type: ignore[attr-defined]
     httpd.login_bucket = Bucket(cfg.login_rate_limit_per_min)  # type: ignore[attr-defined]
+    httpd.join_bucket = Bucket(cfg.join_rate_limit_per_min)  # type: ignore[attr-defined]
     return httpd
 
 

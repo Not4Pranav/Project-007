@@ -242,5 +242,159 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client._request("POST", "/messages", {"text": "x" * 3000}, token=token).status, 422)
 
 
+class ServerMembershipTest(unittest.TestCase):
+    """`/servers`, `/servers/<id>/join|leave|members`: the routes the console's
+    Operational tab drives. Memberships live in the fixture's own tables, which is the
+    whole difference between this and pointing a token at somebody else's room.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.db = seed_db("servers")
+        conn = connect(cls.db)
+        # The seeder randomises private/capacity; this class needs to know which is which.
+        conn.execute("UPDATE servers SET private=0, capacity=NULL")
+        conn.execute("UPDATE servers SET private=1 WHERE id=2")
+        conn.execute("UPDATE servers SET capacity=1 WHERE id=3")
+        conn.execute("DELETE FROM memberships")  # connect() is autocommit; no BEGIN/COMMIT here
+        cls.emails = [r[0] for r in conn.execute(
+            "SELECT email FROM users WHERE status='active' ORDER BY id DESC LIMIT 4").fetchall()]
+        cls.private_slug = conn.execute("SELECT slug FROM servers WHERE id=2").fetchone()[0]
+        conn.close()
+        cls.api = RunningApi(cls.db, rate_limit_per_min=100_000, login_rate_limit_per_min=100_000,
+                             join_rate_limit_per_min=100_000)
+        cls.client = ApiClient(cls.api.base_url)
+        cls.tokens = {}
+        for email in cls.emails:
+            login = cls.client.login(email, PW)
+            assert login.status == 200, login.data
+            cls.tokens[email] = login.data["token"]
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.client.close()
+        cls.api.close()
+
+    def setUp(self) -> None:
+        """Each test owns its ledger: the counts below are exact, and exact numbers only
+        mean something if the starting state is the same every time."""
+        conn = connect(self.db)
+        conn.execute("DELETE FROM memberships")
+        conn.close()
+
+    def auth(self, email: str) -> dict:
+        return {"Authorization": f"Bearer {self.tokens[email]}"}
+
+    def live(self, server_id: int) -> list[int]:
+        conn = connect(self.db)
+        try:
+            return sorted(r[0] for r in conn.execute(
+                "SELECT user_id FROM memberships WHERE server_id=? AND left_ts IS NULL", (server_id,)))
+        finally:
+            conn.close()
+
+    def rows(self, server_id: int) -> int:
+        conn = connect(self.db)
+        try:
+            return int(conn.execute("SELECT COUNT(*) FROM memberships WHERE server_id=?",
+                                   (server_id,)).fetchone()[0])
+        finally:
+            conn.close()
+
+    def test_listing_hides_the_invite_slug(self) -> None:
+        r = self.client.request("GET", "/servers")
+        self.assertEqual(r.status, 200)
+        rows = {s["id"]: s for s in r.data["servers"]}
+        self.assertEqual(rows[2]["private"], 1)
+        self.assertIsNone(rows[2]["slug"], "a list endpoint must not hand out the invite code")
+        self.assertIsInstance(rows[1]["slug"], str, "public rows stay identifiable")
+        self.assertEqual(rows[1]["members"], len(self.live(1)),
+                         "members is the live count, not the row count")
+
+    def test_join_requires_a_bearer(self) -> None:
+        r = self.client.request("POST", "/servers/1/join", {})
+        self.assertEqual(r.status, 401)
+        self.assertIn("bearer", str(r.data["error"]).lower())
+
+    def test_join_leave_rejoin_is_one_row_with_history(self) -> None:
+        who = self.emails[0]
+        uid = self.client.me(self.tokens[who]).data["id"]  # me() takes the token, not the header
+        joined = self.client.request("POST", "/servers/1/join", {}, extra_headers=self.auth(who))
+        self.assertEqual(joined.status, 201, joined.data)
+        self.assertEqual(joined.data["state"], "joined")
+        self.assertEqual(joined.data["members"], 1)
+        self.assertEqual(self.live(1), [uid])
+
+        again = self.client.request("POST", "/servers/1/join", {}, extra_headers=self.auth(who))
+        self.assertEqual(again.status, 409, again.data)
+        self.assertEqual(self.rows(1), 1, "a duplicate join must not invent a membership row")
+
+        left = self.client.request("POST", "/servers/1/leave", {}, extra_headers=self.auth(who))
+        self.assertEqual(left.status, 200, left.data)
+        self.assertGreaterEqual(left.data["held_seconds"], 0)
+        self.assertEqual(self.live(1), [])
+        self.assertEqual(self.rows(1), 1, "leave stamps left_ts; it does not delete the row")
+
+        twice = self.client.request("POST", "/servers/1/leave", {}, extra_headers=self.auth(who))
+        self.assertEqual(twice.status, 409, twice.data)
+
+        back = self.client.request("POST", "/servers/1/join", {}, extra_headers=self.auth(who))
+        self.assertEqual(back.status, 200, back.data)
+        self.assertEqual(back.data["state"], "rejoined")
+        self.assertEqual(self.rows(1), 1, "rejoin reopens the row rather than appending")
+
+    def test_capacity_and_private_gates_are_the_apps(self) -> None:
+        first = self.client.request("POST", "/servers/3/join", {}, extra_headers=self.auth(self.emails[0]))
+        self.assertEqual(first.status, 201, first.data)
+        second = self.client.request("POST", "/servers/3/join", {}, extra_headers=self.auth(self.emails[1]))
+        self.assertEqual(second.status, 403, second.data)
+        self.assertIn("capacity", str(second.data["error"]))
+        self.assertEqual(self.live(3), [first.data["user_id"]])
+
+        blocked = self.client.request("POST", "/servers/2/join", {}, extra_headers=self.auth(self.emails[2]))
+        self.assertEqual(blocked.status, 403, blocked.data)
+        self.assertIn("private", str(blocked.data["error"]))
+        with_slug = self.client.request("POST", "/servers/2/join", {"invite": self.private_slug},
+                                       extra_headers=self.auth(self.emails[2]))
+        self.assertEqual(with_slug.status, 201, with_slug.data)
+
+    def test_members_is_keyset_paginated_and_read_only(self) -> None:
+        for email in self.emails[:3]:
+            r = self.client.request("POST", "/servers/4/join", {}, extra_headers=self.auth(email))
+            self.assertEqual(r.status, 201, r.data)
+        page = self.client.request("GET", "/servers/4/members?limit=2")
+        self.assertEqual(page.status, 200)
+        self.assertEqual(len(page.data["members"]), 2)
+        self.assertIsNotNone(page.data["next_cursor"])
+        rest = self.client.request("GET", f"/servers/4/members?limit=2&cursor={page.data['next_cursor']}")
+        self.assertEqual(len(rest.data["members"]), 1)
+        self.assertIsNone(rest.data["next_cursor"])
+        bad = self.client.request("GET", "/servers/4/members?cursor=nonsense")
+        self.assertEqual(bad.status, 400, bad.data)
+        forced = self.client.request("POST", "/servers/4/members", {})
+        self.assertEqual(forced.status, 405, forced.data)
+        self.assertIn("/leave", str(forced.data["error"]), "405 must say where to go instead")
+
+    def test_join_throttling_has_its_own_bucket(self) -> None:
+        """`/auth/register` and `/servers/<id>/join` must not share a limiter: a bulk join
+        that starved registration would hide the very behaviour a load run is measuring."""
+        api = RunningApi(self.db, rate_limit_per_min=100_000, login_rate_limit_per_min=100_000,
+                          join_rate_limit_per_min=1)
+        client = ApiClient(api.base_url)
+        try:
+            token = client.login(self.emails[3], PW).data["token"]
+            hdrs = {"Authorization": f"Bearer {token}"}
+            one = client.request("POST", "/servers/5/join", {}, extra_headers=hdrs)
+            self.assertIn(one.status, (200, 201), one.data)
+            two = client.request("POST", "/servers/5/join", {}, extra_headers=hdrs)
+            self.assertEqual(two.status, 429, two.data)
+            self.assertIn("retry_after_s", two.data)
+            reg = client.register("bucket.check@loadtest.invalid", "bucket_check", PW)
+            self.assertEqual(reg.status, 201, "register kept its own headroom")
+        finally:
+            client.close()
+            api.close()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

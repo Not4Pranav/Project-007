@@ -37,7 +37,7 @@ def ruff_command() -> list[str] | None:
 # has to be listed here, which is the point: the two tests below then check its help
 # output and every flag the README promises for it.
 CLI_MODULES = ("seeds.seed", "seeds.report_cli", "seeds.export", "abuse.detector",
-               "mockapi.server", "load.engine", "load.accounts")
+               "mockapi.server", "load.engine", "load.accounts", "console")
 
 
 @unittest.skipUnless(ruff_command(), "ruff not installed (`pip install ruff` enables this)")
